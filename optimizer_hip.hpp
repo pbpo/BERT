@@ -9,8 +9,11 @@
 class ShampooOptimizer {
 private:
     std::vector<Parameter*>& params_;
-    float lr_, beta2_, epsilon_;
-    int update_freq_, t_ = 0;
+    float lr_;
+    int update_freq_;           // update_freq_를 beta2_ 앞으로 이동
+    float beta2_;               
+    float epsilon_;             // epsilon_을 beta2_ 뒤로 이동
+    int t_ = 0;
     
     // 상태 저장을 위해 파라미터 텐서 포인터를 키로 사용하는 map
     std::map<const GpuTensor*, GpuTensor> preconditioners_L_;
@@ -18,11 +21,12 @@ private:
     std::map<const GpuTensor*, GpuTensor> stats_GGT_;
     std::map<const GpuTensor*, GpuTensor> stats_GTG_;
 
-    void compute_matrix_inverse_root(hipStream_t stream, rocblas_handle handle, GpuTensor& out, const GpuTensor& in);
+  
 
 public:
     ShampooOptimizer(std::vector<Parameter*>& params, float lr = 1e-3, int update_freq = 20, float beta2=0.999f, float epsilon=1e-8f);
     void step(hipStream_t stream, rocblas_handle handle);
+      void compute_matrix_inverse_root(hipStream_t stream, rocblas_handle handle, GpuTensor& out, const GpuTensor& in);
 };
 
 // --- AdamW Optimizer 클래스 ---

@@ -1,11 +1,13 @@
 #ifndef COMMON_HIP_HPP
 #define COMMON_HIP_HPP
 
+// 개선 사항 9: include 순서 정리
 #include <iostream>
-#include <vector>
-#include <string>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <vector>
+
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
@@ -43,35 +45,50 @@ public:
     std::string name_;
     bool allocated_ = false;
     DataType dtype = DataType::FLOAT32;
-    bool is_view_ = false; // 뷰(View) 여부 플래그 추가
+    bool is_view_ = false;
 
     GpuTensor(const std::string& name = "");
     GpuTensor(const std::vector<int>& dimensions, const std::string& name = "", DataType type = DataType::FLOAT32);
-    ~GpuTensor();
+    ~GpuTensor() noexcept; // 개선 사항: 소멸자에서 예외가 발생하지 않도록 noexcept 명시
 
-    // 복사 생성자 및 대입 연산자 삭제
     GpuTensor(const GpuTensor&) = delete;
     GpuTensor& operator=(const GpuTensor&) = delete;
 
-    // 이동 생성자 및 대입 연산자
     GpuTensor(GpuTensor&& other) noexcept;
     GpuTensor& operator=(GpuTensor&& other) noexcept;
 
     void allocate(const std::vector<int>& new_dims);
-    void set_view(void* ptr, const std::vector<int>& dims, DataType type = DataType::FLOAT32); // 뷰 설정 함수 추가
+    void set_view(void* ptr, const std::vector<int>& dims, DataType type = DataType::FLOAT32);
     void free();
-    void zero_out(hipStream_t stream);
+    void zero_out(hipStream_t stream = 0);
 
     template<typename T>
     void to_gpu(const std::vector<T>& data);
     template<typename T>
     std::vector<T> to_cpu() const;
-    void copy_from_gpu(const GpuTensor& src, hipStream_t stream);
+    void copy_from_gpu(const GpuTensor& src, hipStream_t stream = 0);
 
     size_t size_in_bytes() const { return num_elements_ * element_size_; }
     bool is_allocated() const { return allocated_; }
     int dim_size(int i) const { return dims_.at(i); }
 };
+
+/**
+ * @brief [개선 사항 7] 텐서가 할당되었는지 확인하고, 필요 시 새로 할당하는 헬퍼 함수.
+ * @param t 검사할 GpuTensor.
+ * @param new_dims 원하는 텐서 차원.
+ * @param stream HIP 스트림.
+ * @param zero 초기화 여부.
+ */
+inline void ensure_allocated(GpuTensor& t, const std::vector<int>& new_dims, bool zero = false, hipStream_t stream = 0) {
+    bool needs_alloc = !t.is_allocated() || t.dims_ != new_dims;
+    if (needs_alloc) {
+        t.allocate(new_dims);
+    }
+    if (zero && t.is_allocated()) {
+        t.zero_out(stream);
+    }
+}
 
 // --- Parameter: 학습 가능한 가중치와 기울기를 관리하는 클래스 ---
 class Parameter {
@@ -90,4 +107,4 @@ public:
     void allocate_gradients();
 };
 
-#endif 
+#endif

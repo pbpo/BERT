@@ -281,12 +281,16 @@ void BertAttention::backward(rocblas_handle blas_handle, hipStream_t stream,
 
     GpuTensor grad_after_dropout;
     grad_after_dropout.allocate(grad_after_layernorm.dims_);
+    
+    // 수정된 부분: LayerNorm의 역전파 결과를 Dropout의 역전파 입력으로 복사합니다.
+    grad_after_dropout.copy_from_gpu(grad_after_layernorm, stream);
+
+    // 이제 올바른 Gradient가 전달됩니다.
     output_dropout_.backward(stream, grad_after_dropout, cache.output_dropout_cache);
 
     GpuTensor grad_after_dense;
     grad_after_dense.allocate(cache.self_attention_cache.context_layer.dims_); 
     output_dense_.backward(blas_handle, stream, grad_after_dropout, cache.output_dense_cache, grad_after_dense);
 
-  self_attention_.backward(blas_handle, stream, grad_after_dense, cache.self_attention_cache, grad_input_tensor);
-
+    self_attention_.backward(blas_handle, stream, grad_after_dense, cache.self_attention_cache, grad_input_tensor);
 }

@@ -79,7 +79,6 @@ void BertEmbeddings::backward(hipStream_t stream,
     word_embeddings_.allocate_gradients();
     position_embeddings_.allocate_gradients();
     token_type_embeddings_.allocate_gradients();
-    // layernorm_.params.allocate_gradients(); // REMOVED: LayerNorm handles its own gradients
 
     GpuTensor grad_after_dropout, grad_after_layernorm;
     grad_after_dropout.allocate(grad_output_embeddings.dims_);
@@ -91,11 +90,31 @@ void BertEmbeddings::backward(hipStream_t stream,
     
     layernorm_.backward(stream, grad_after_dropout, cache.layernorm_cache, grad_after_layernorm);
 
+    // 필요한 변수들 선언
+    const int batch_size = cache.input_ids_ptr->dim_size(0);
+    const int seq_len = cache.input_ids_ptr->dim_size(1);
+    const int hidden_size = config_.hidden_size;
+    const int vocab_size = config_.vocab_size;
+
+    // Word embeddings backward
     launch_embedding_backward_kernel(stream,
-                                     (float*)word_embeddings_.grad_weights.d_ptr_, (float*)position_embeddings_.grad_weights.d_ptr_, (float*)token_type_embeddings_.grad_weights.d_ptr_,
-                                     (const float*)grad_after_layernorm.d_ptr_,
-                                     (const int*)cache.input_ids_ptr->d_ptr_, (const int*)cache.token_type_ids_ptr->d_ptr_,
-                                     cache.input_ids_ptr->dim_size(0), cache.input_ids_ptr->dim_size(1), config_.hidden_size);
+        (float*)word_embeddings_.grad_weights.d_ptr_,      // grad_word_embeddings
+        (const float*)grad_after_layernorm.d_ptr_,         // grad_output  
+        (const int*)cache.input_ids_ptr->d_ptr_,           // input_ids
+        batch_size, seq_len, hidden_size, vocab_size);
+
+    // Position embeddings backward  
+    launch_accumulate_positional_embedding_grad(stream,
+        (float*)position_embeddings_.grad_weights.d_ptr_,
+        (const float*)grad_after_layernorm.d_ptr_,
+        batch_size, seq_len, hidden_size);
+
+    // Token type embeddings backward
+    launch_accumulate_token_type_embedding_grad(stream,
+        (float*)token_type_embeddings_.grad_weights.d_ptr_,
+        (const float*)grad_after_layernorm.d_ptr_,
+        (const int*)cache.token_type_ids_ptr->d_ptr_,
+        batch_size, seq_len, hidden_size);
 }
 
 // ============================================================================
@@ -143,23 +162,21 @@ void BertLayer::forward(rocblas_handle blas_handle, hipStream_t stream,
 
     // --- 2. FFN (Feed-Forward Network) ---
     GpuTensor intermediate_output;
-    // FIXED: Explicitly create std::vector for allocate
-    intermediate_output.allocate(std::vector<int>{input_hidden_states.dim_size(0), input_hidden_states.dim_size(1), config_.intermediate_size});
+    std::vector<int> intermediate_dims = {input_hidden_states.dim_size(0), input_hidden_states.dim_size(1), config_.intermediate_size};
+    intermediate_output.allocate(intermediate_dims);
     ffn_intermediate_dense_.forward(blas_handle, stream, attention_output, intermediate_output, cache.ffn_intermediate_dense_cache);
 
     GpuTensor ffn_output_dense_result;
-    ffn_output_dense_result.allocate(input_hidden_states.dims_);
+    ffn_output_dense_result.allocate(attention_output.dims_);
     ffn_output_dense_.forward(blas_handle, stream, intermediate_output, ffn_output_dense_result, cache.ffn_output_dense_cache);
     ffn_output_dropout_.forward(stream, ffn_output_dense_result, cache.ffn_output_dropout_cache, is_training);
 
-    // FFN 잔차 연결 및 최종 LayerNorm
+    // --- 3. 잔차 연결 및 LayerNorm ---
     GpuTensor ffn_residual_sum_output;
     ffn_residual_sum_output.allocate(ffn_output_dense_result.dims_);
-    // FIXED: .d_ptr to .d_ptr_
     launch_elementwise_add_kernel(stream, (float*)ffn_residual_sum_output.d_ptr_, (const float*)ffn_output_dense_result.d_ptr_, (const float*)attention_output.d_ptr_, ffn_residual_sum_output.num_elements_);
     ffn_output_layernorm_.forward(stream, ffn_residual_sum_output, output_hidden_states, cache.ffn_output_layernorm_cache);
 }
-
 void BertLayer::backward(rocblas_handle blas_handle, hipStream_t stream,
                          const GpuTensor& grad_output_hidden_states,
                          BertLayerCache& cache,

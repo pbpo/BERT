@@ -10,178 +10,135 @@
 // BertLMPredictionHead Implementation
 // ============================================================================
 BertLMPredictionHead::BertLMPredictionHead(const BertConfig& config, Parameter& shared_word_embeddings_parameter, const std::string& name_prefix)
-    : config_(config),
-      transform_dense_(config.hidden_size, config.hidden_size, config, name_prefix + ".transform.dense"), // BertConfig passed here due to original DenseLayer constructor
-      // transform_act_fn_(), // GELU is fused into DenseLayer as per nn_layers_hip.cpp
+    : config_(config),  // config_ 먼저 초기화
+      transform_dense_(config, config.hidden_size, config.hidden_size, name_prefix + ".transform.dense"),
       transform_layernorm_(config.hidden_size, config.layer_norm_eps, name_prefix + ".transform.LayerNorm"),
-      decoder_bias_({config.vocab_size}, name_prefix + ".bias"), // Parameter constructor
-      shared_word_embeddings_(shared_word_embeddings_parameter) {
-        // Ensure shared_word_embeddings's weight tensor is (vocab_size, hidden_size)
-        if (shared_word_embeddings_.weights.dims_.size() != 2 ||
-            shared_word_embeddings_.weights.dim_size(0) != config.vocab_size ||
-            shared_word_embeddings_.weights.dim_size(1) != config.hidden_size) {
-            throw std::runtime_error("Shared word embedding dimensions mismatch in BertLMPredictionHead.");
-        }
-      }
+      shared_word_embeddings_(shared_word_embeddings_parameter),
+      decoder_bias_({config.vocab_size}, name_prefix + ".bias") {}  // bias_ → decoder_bias_
 
 std::vector<Parameter*> BertLMPredictionHead::get_parameters() {
     auto dense_params = transform_dense_.get_parameters();
     auto ln_params = transform_layernorm_.get_parameters();
-    // Note: shared_word_embeddings_ is NOT returned here as its ownership is with BertEmbeddings.
-    // Only decoder_bias_ is unique to this head, plus transform parameters.
+    
     std::vector<Parameter*> params;
     params.insert(params.end(), dense_params.begin(), dense_params.end());
     params.insert(params.end(), ln_params.begin(), ln_params.end());
-    params.push_back(&decoder_bias_);
+    params.push_back(&decoder_bias_);  // bias_ → decoder_bias_
     return params;
 }
 
 void BertLMPredictionHead::forward(rocblas_handle blas_handle, hipStream_t stream,
-                                 const GpuTensor& hidden_states, // (B, S, H)
-                                 GpuTensor& logits,             // Output: (B, S, V)
-                                 BertLMPredictionHeadCache& cache) {
-    if (!hidden_states.is_allocated()) {
-        throw std::runtime_error("Input hidden_states not allocated for BertLMPredictionHead forward.");
-    }
+                                   const GpuTensor& hidden_states, GpuTensor& logits, 
+                                   BertLMPredictionHeadCache& cache) {
     int batch_size = hidden_states.dim_size(0);
     int seq_len = hidden_states.dim_size(1);
-    // int hidden_size = hidden_states.dim_size(2); // Should match config_.hidden_size
-
     std::vector<int> logits_dims = {batch_size, seq_len, config_.vocab_size};
+    
     if (!logits.is_allocated() || logits.dims_ != logits_dims) {
         logits.allocate(logits_dims);
     }
-
+    
     cache.hidden_states_input = &hidden_states;
 
-    // 1. Transform part: Dense -> (GELU is fused in DenseLayer) -> LayerNorm
-    // Output of DenseLayer (which includes GELU): (B, S, H)
+    // Dense layer forward
     cache.transform_dense_output.allocate(hidden_states.dims_);
     transform_dense_.forward(blas_handle, stream, hidden_states, cache.transform_dense_output, cache.transform_dense_cache);
 
-    // LayerNorm on the output of dense+GELU
-    // Output of LayerNorm: (B, S, H) - this is `transformed_states` in user's original code
-    cache.transform_layernorm_output.allocate(hidden_states.dims_);
-    transform_layernorm_.forward(stream, cache.transform_dense_output, cache.transform_layernorm_output, cache.transform_layernorm_cache);
+    // GELU forward  
+    cache.transform_gelu_output.allocate(cache.transform_dense_output.dims_);
+    transform_gelu_.forward(stream, cache.transform_dense_output, cache.transform_gelu_output, cache.transform_gelu_cache);
 
-    // 2. Decoder part: MatMul with shared word_embeddings + add bias
-    // logits = transform_layernorm_output * word_embeddings.weights^T + decoder_bias_
-    // transform_layernorm_output: (B*S, H)
-    // word_embeddings.weights: (V, H) -> transpose to (H, V)
-    // logits: (B*S, V)
+    // LayerNorm forward
+    cache.transform_layernorm_output.allocate(cache.transform_gelu_output.dims_);
+    transform_layernorm_.forward(stream, cache.transform_gelu_output, cache.transform_layernorm_output, cache.transform_layernorm_cache);
 
-    const float alpha = 1.0f, beta = 0.0f;
+    // Matrix multiplication with shared word embeddings
     int M = batch_size * seq_len;
     int K = config_.hidden_size;
     int N = config_.vocab_size;
-
-    ROCBLAS_CHECK(rocblas_set_stream(blas_handle, stream));
-    // C_MN = A_MK * B_KN^T where B is stored as (N,K)
-    // A is transform_layernorm_output (M, K)
-    // B is shared_word_embeddings_.weights (N=Vocab, K=Hidden)
-    // C is logits (M, N=Vocab)
-    ROCBLAS_CHECK(rocblas_sgemm(blas_handle,
-                                rocblas_operation_none,       // opA
-                                rocblas_operation_transpose,  // opB (weights are V,H, use as H,V)
-                                M, N, K,
-                                &alpha,
-                                (const float*)cache.transform_layernorm_output.d_ptr_, K, // A, lda=K
-                                (const float*)shared_word_embeddings_.weights.d_ptr_, K,   // B (stored N,K), ldb=K
+    
+    const float alpha = 1.0f, beta = 0.0f;
+    ROCBLAS_CHECK(rocblas_sgemm(blas_handle, rocblas_operation_none, rocblas_operation_transpose,
+                                M, N, K, &alpha,
+                                (const float*)cache.transform_layernorm_output.d_ptr_, K,
+                                (const float*)shared_word_embeddings_.weights.d_ptr_, K,
                                 &beta,
-                                (float*)logits.d_ptr(), N));                             // C, ldc=N
+                                (float*)logits.d_ptr_, N));
 
-    // Add decoder bias. Bias is (V). Needs to be broadcasted/added to each row of (B*S, V)
-    // launch_add_bias_kernel(stream, output, input, bias, M_rows, N_cols)
-    // Here output=logits, input=logits (in-place), bias=decoder_bias_.weights
-    // M_rows = M (batch_size * seq_len), N_cols = N (vocab_size)
+    // Add decoder bias
     launch_add_bias_kernel(stream,
                            (float*)logits.d_ptr_,
-                           (const float*)logits.d_ptr_, // In-place addition
-                           (const float*)decoder_bias_.weights.d_ptr_, // Bias tensor
+                           (const float*)logits.d_ptr_,
+                           (const float*)decoder_bias_.weights.d_ptr_,
                            M, N);
-    // cache.logits_output_ptr = &logits; // Store pointer if needed, but logits is output param
 }
 
 void BertLMPredictionHead::backward(rocblas_handle blas_handle, hipStream_t stream,
-                                  const GpuTensor& grad_logits, // (B, S, V)
-                                  BertLMPredictionHeadCache& cache,
-                                  GpuTensor& grad_hidden_states) { // Output: (B, S, H)
+                                    const GpuTensor& grad_logits, BertLMPredictionHeadCache& cache,
+                                    GpuTensor& grad_hidden_states) {
     if (!grad_logits.is_allocated() || !cache.hidden_states_input || !cache.hidden_states_input->is_allocated() ||
-        !cache.transform_layernorm_output.is_allocated() ) {
-        throw std::runtime_error("Required tensors/cache not allocated for BertLMPredictionHead backward.");
+        !cache.transform_layernorm_output.is_allocated()) {
+        throw std::runtime_error("Required tensors not allocated for BertLMPredictionHead::backward");
     }
+
     if(!grad_hidden_states.is_allocated() || grad_hidden_states.dims_ != cache.hidden_states_input->dims_){
         grad_hidden_states.allocate(cache.hidden_states_input->dims_);
-        grad_hidden_states.zero_out(stream); // Ensure it's zeroed for accumulation by DenseLayer backward
     }
 
-    // Ensure gradient tensors for parameters are allocated
-    transform_dense_.params.allocate_gradients();
-    transform_layernorm_.params.allocate_gradients();
-    decoder_bias_.allocate_gradients(); // For decoder_bias_.grad_weights
-    // shared_word_embeddings_.grad_weights is allocated by BertEmbeddings module.
+    // Allocate gradients for all parameters - public 메서드 사용
+    transform_dense_.allocate_gradients();
+    transform_layernorm_.allocate_gradients();
+    decoder_bias_.allocate_gradients();
 
-    int M = grad_logits.dim_size(0) * grad_logits.dim_size(1); // batch_size * seq_len
-    int N_vocab = grad_logits.dim_size(2); // vocab_size
-    int K_hidden = cache.hidden_states_input->dim_size(2); // hidden_size
+    int batch_size = cache.hidden_states_input->dim_size(0);
+    int seq_len = cache.hidden_states_input->dim_size(1);
+    int vocab_size = config_.vocab_size;
+    int K_hidden = cache.hidden_states_input->dim_size(2);
 
-    const float alpha = 1.0f;
-    const float beta_zero = 0.0f;
-    const float beta_one = 1.0f; // For accumulation
+    // Step 1: Compute grad_bias (reduce sum over batch and sequence dimensions)
+    launch_reduce_sum_kernel(stream,
+                            (float*)decoder_bias_.grad_weights.d_ptr_,
+                            (const float*)grad_logits.d_ptr_,
+                            batch_size * seq_len, vocab_size);
 
-    ROCBLAS_CHECK(rocblas_set_stream(blas_handle, stream));
+    // Step 2: Compute gradients w.r.t. shared word embeddings
+    int M_vocab = vocab_size;
+    int N_hidden = K_hidden;
+    int K_batch = batch_size * seq_len;
 
-    // 1. Backward for decoder bias: sum grad_logits along batch_seq dimension
-    // grad_logits is (M, N_vocab). Sum over M.
-    // launch_reduce_sum_axis0_add_kernel(stream, out_grad (N_vocab), in_grad (M, N_vocab), M_reduce, N_keep)
-    launch_reduce_sum_axis0_add_kernel(stream,
-                                   (float*)decoder_bias_.grad_weights.d_ptr(), // out_grad_bias (V)
-                                   (const float*)grad_logits.d_ptr(),        // in_grad_logits (B*S, V)
-                                   M, N_vocab);
+    const float alpha = 1.0f, beta = 1.0f; // Use beta=1 for accumulating gradients
 
-    // 2. Backward for shared_word_embeddings_.weights (dL/dW_embed)
-    // dL/dW_embed = grad_logits^T * transform_layernorm_output
-    // grad_logits (M, N_v) -> use as (N_v, M)
-    // transform_layernorm_output (M, K_h)
-    // dL/dW_embed (N_v, K_h) - This matches dimensions of shared_word_embeddings_.weights
-    ROCBLAS_CHECK(rocblas_sgemm(blas_handle,
-                                rocblas_operation_transpose, // opA (grad_logits)
-                                rocblas_operation_none,    // opB (transform_layernorm_output)
-                                N_vocab, K_hidden, M,      // m, n, k
-                                &alpha,
-                                (const float*)grad_logits.d_ptr(), N_vocab, // A (M,N_v) lda=N_v
-                                (const float*)cache.transform_layernorm_output.d_ptr(), K_hidden, // B (M,K_h) ldb=K_h
-                                &beta_one, // Accumulate to existing gradients in shared_word_embeddings_
-                                (float*)shared_word_embeddings_.grad_weights.d_ptr(), K_hidden)); // C (N_v,K_h) ldc=K_h
+    ROCBLAS_CHECK(rocblas_sgemm(blas_handle, rocblas_operation_transpose, rocblas_operation_none,
+                                M_vocab, N_hidden, K_batch, &alpha,
+                                (const float*)grad_logits.d_ptr_, vocab_size,
+                                (const float*)cache.transform_layernorm_output.d_ptr_, K_hidden,
+                                &beta,
+                                (float*)shared_word_embeddings_.grad_weights.d_ptr_, K_hidden));
 
-    // 3. Backward for transform_layernorm_output (dL/dX_transformed)
-    // dL/dX_transformed = grad_logits * shared_word_embeddings_.weights (no transpose on weights)
-    // grad_logits (M, N_v)
-    // shared_word_embeddings_.weights (N_v, K_h)
-    // dL/dX_transformed (M, K_h)
+    // Step 3: Compute gradients w.r.t. transform_layernorm_output  
     GpuTensor grad_transform_layernorm_output;
     grad_transform_layernorm_output.allocate(cache.transform_layernorm_output.dims_);
-    ROCBLAS_CHECK(rocblas_sgemm(blas_handle,
-                                rocblas_operation_none,    // opA (grad_logits)
-                                rocblas_operation_none,    // opB (shared_word_embeddings_.weights)
-                                M, K_hidden, N_vocab,      // m, n, k
-                                &alpha,
-                                (const float*)grad_logits.d_ptr(), N_vocab, // A (M,N_v) lda=N_v
-                                (const float*)shared_word_embeddings_.weights.d_ptr(), K_hidden, // B (N_v,K_h) ldb=K_h
-                                &beta_zero,
-                                (float*)grad_transform_layernorm_output.d_ptr(), K_hidden)); // C (M,K_h) ldc=K_h
 
-    // 4. Backward for transform LayerNorm
-    GpuTensor grad_transform_dense_output; // Grad w.r.t. output of transform_dense (input to LayerNorm)
+    ROCBLAS_CHECK(rocblas_sgemm(blas_handle, rocblas_operation_none, rocblas_operation_none,
+                                K_batch, N_hidden, M_vocab, &alpha,
+                                (const float*)grad_logits.d_ptr_, vocab_size,
+                                (const float*)shared_word_embeddings_.weights.d_ptr_, K_hidden,
+                                &beta,
+                                (float*)grad_transform_layernorm_output.d_ptr_, K_hidden));
+
+    // Step 4: Backward through LayerNorm
+    GpuTensor grad_transform_gelu_output;
+    grad_transform_gelu_output.allocate(cache.transform_gelu_output.dims_);
+    transform_layernorm_.backward(stream, grad_transform_layernorm_output, cache.transform_layernorm_cache, grad_transform_gelu_output);
+
+    // Step 5: Backward through GELU
+    GpuTensor grad_transform_dense_output;
     grad_transform_dense_output.allocate(cache.transform_dense_output.dims_);
-    transform_layernorm_.backward(stream, grad_transform_layernorm_output, cache.transform_layernorm_cache, grad_transform_dense_output);
+    transform_gelu_.backward(stream, grad_transform_gelu_output, grad_transform_dense_output, cache.transform_gelu_cache);
 
-    // 5. Backward for transform Dense (and its fused GELU)
-    // grad_hidden_states is the final output gradient w.r.t. input of this head.
-    // DenseLayer::backward needs to handle GELU derivative internally. (Currently a GAP in nn_layers_hip.cpp)
+    // Step 6: Backward through Dense layer
     transform_dense_.backward(blas_handle, stream, grad_transform_dense_output, cache.transform_dense_cache, grad_hidden_states);
 }
-
 
 // ============================================================================
 // CANBertForMaskedLM Implementation
@@ -204,8 +161,13 @@ CANBertForMaskedLM::CANBertForMaskedLM(const BertConfig& cfg) : config_(cfg) { /
 }
 
 CANBertForMaskedLM::~CANBertForMaskedLM() {
+    if (stream_) {
+        hipError_t err = hipStreamDestroy(stream_);
+        if (err != hipSuccess) {
+            // Log error but don't throw in destructor
+        }
+    }
     if (blas_handle_) rocblas_destroy_handle(blas_handle_);
-    if (stream_) hipStreamDestroy(stream_);
 }
 
 void CANBertForMaskedLM::initialize_parameters(float mean, float stddev) {
@@ -222,10 +184,10 @@ std::vector<Parameter*> CANBertForMaskedLM::get_parameters() {
 }
 
 void CANBertForMaskedLM::train_step(const GpuTensor& input_ids,
-                                  const GpuTensor& attention_mask,
-                                  const GpuTensor& token_type_ids,
-                                  const GpuTensor& labels, // (B, S)
-                                  GpuTensor& loss_output) { // Scalar output
+                                    const GpuTensor& attention_mask,
+                                    const GpuTensor& token_type_ids,
+                                    const GpuTensor& labels,
+                                    GpuTensor& loss) { // Scalar output
     if (!input_ids.is_allocated() || !attention_mask.is_allocated() || !labels.is_allocated()) {
         throw std::runtime_error("Input tensors (input_ids, attention_mask, labels) must be allocated for train_step.");
     }
@@ -252,20 +214,21 @@ void CANBertForMaskedLM::train_step(const GpuTensor& input_ids,
     GpuTensor grad_logits; // (B, S, V) - Gradient of loss w.r.t. logits
     grad_logits.allocate(logits.dims_);
 
-    if (!loss_output.is_allocated() || loss_output.num_elements_ != 1) {
-        loss_output.allocate({1}); // Scalar loss
+ if (!loss.is_allocated() || loss.num_elements_ != 1) {
+        loss.allocate({1}); // Scalar loss
     }
-    loss_output.zero_out(stream_); // Initialize loss to zero for accumulation
+    loss.zero_out(stream_); // Initialize loss to zero for accumulation
 
     // This kernel calculates dL/dLogits and sum(-log_probs) for the loss.
-    launch_softmax_cross_entropy_loss_backward_optimized(stream_,
+   launch_softmax_cross_entropy_loss_backward_optimized(stream_,
                                                (float*)grad_logits.d_ptr_,
                                                (const float*)logits.d_ptr_,
                                                (const int*)labels.d_ptr_,
-                                               (float*)loss_output.d_ptr_,
+                                               (float*)loss.d_ptr_,
                                                input_ids.dim_size(0), // B
                                                input_ids.dim_size(1), // S
-                                               config_.vocab_size);   // V
+                                               config_.vocab_size,    // V
+                                               -100);      
     HIP_CHECK(hipGetLastError()); // Check after kernel launch
 
     // --- Backward Pass ---
@@ -276,7 +239,7 @@ void CANBertForMaskedLM::train_step(const GpuTensor& input_ids,
     bert_model_->backward(blas_handle_, stream_, grad_sequence_output, model_cache);
 
     // --- Optimizer Step ---
-    optimizer_->step();
+    optimizer_->step(stream_);
 
     // Synchronize stream to ensure all operations are complete, especially if loss is read by CPU next.
     HIP_CHECK(hipStreamSynchronize(stream_));

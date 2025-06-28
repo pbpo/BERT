@@ -3,10 +3,10 @@
 
 #include "common_hip.hpp"
 #include "bert_config.hpp"
-#include "nn_layers_hip.hpp" // Include the base layers
+#include "nn_layers_hip.hpp" // DenseLayer, Dropout, LayerNorm 등이 여기에 있음
 
 // --- Forward Declarations ---
-// No longer need to forward declare DenseCache, etc.
+// 이곳에는 전방 선언이 필요 없습니다.
 
 // --- Cache Structs ---
 struct SelfAttentionCache {

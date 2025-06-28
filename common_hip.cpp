@@ -1,6 +1,6 @@
 #include "common_hip.hpp"
-#include <random>
 #include <numeric>
+#include <random>
 
 // ============================================================================
 // GpuTensor Class Implementations
@@ -13,20 +13,23 @@ GpuTensor::GpuTensor(const std::vector<int>& dimensions, const std::string& name
     allocate(dims_);
 }
 
-GpuTensor::~GpuTensor() {
-    free();
+GpuTensor::~GpuTensor() noexcept {
+    try {
+        free();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "ERROR in GpuTensor destructor for %s: %s\n", name_.c_str(), e.what());
+    }
 }
 
-GpuTensor::GpuTensor(GpuTensor&& other) noexcept {
-    d_ptr_ = other.d_ptr_;
-    dims_ = std::move(other.dims_);
-    num_elements_ = other.num_elements_;
-    element_size_ = other.element_size_;
-    name_ = std::move(other.name_);
-    allocated_ = other.allocated_;
-    dtype = other.dtype;
-    is_view_ = other.is_view_; // 뷰 플래그 이동
-    
+GpuTensor::GpuTensor(GpuTensor&& other) noexcept
+    : d_ptr_(other.d_ptr_),
+      dims_(std::move(other.dims_)),
+      num_elements_(other.num_elements_),
+      element_size_(other.element_size_),
+      name_(std::move(other.name_)),
+      allocated_(other.allocated_),
+      dtype(other.dtype),
+      is_view_(other.is_view_) {
     other.d_ptr_ = nullptr;
     other.allocated_ = false;
     other.is_view_ = false;
@@ -43,7 +46,7 @@ GpuTensor& GpuTensor::operator=(GpuTensor&& other) noexcept {
         name_ = std::move(other.name_);
         allocated_ = other.allocated_;
         dtype = other.dtype;
-        is_view_ = other.is_view_; // 뷰 플래그 이동
+        is_view_ = other.is_view_;
 
         other.d_ptr_ = nullptr;
         other.allocated_ = false;
@@ -54,16 +57,26 @@ GpuTensor& GpuTensor::operator=(GpuTensor&& other) noexcept {
 }
 
 void GpuTensor::allocate(const std::vector<int>& new_dims) {
+    if (is_view_) {
+        // Views should not re-allocate memory themselves.
+        // Detach the view first if reallocation is needed.
+        d_ptr_ = nullptr;
+        is_view_ = false;
+    }
+
     dims_ = new_dims;
-    is_view_ = false; // 새로 할당하는 것은 뷰가 아님
     size_t new_num_elements = 1;
     for (int dim : dims_) {
-        if (dim <= 0) throw std::runtime_error("Tensor dimension must be positive for " + name_);
+        if (dim <= 0) {
+            new_num_elements = 0;
+            break;
+        }
         new_num_elements *= dim;
     }
 
     if (new_num_elements == 0) {
         free();
+        num_elements_ = 0;
         return;
     }
 
@@ -71,89 +84,89 @@ void GpuTensor::allocate(const std::vector<int>& new_dims) {
     size_t new_size_bytes = new_num_elements * element_size_;
     size_t current_size_bytes = allocated_ ? num_elements_ * element_size_ : 0;
 
-    if (new_size_bytes != current_size_bytes || d_ptr_ == nullptr) {
+    if (new_size_bytes != current_size_bytes) {
         free();
-        if (new_num_elements > 0) {
-            num_elements_ = new_num_elements;
-            HIP_CHECK(hipMalloc(&d_ptr_, new_size_bytes));
-            allocated_ = true;
-        }
+        num_elements_ = new_num_elements;
+        HIP_CHECK(hipMalloc(&d_ptr_, new_size_bytes));
+        allocated_ = true;
     } else {
         num_elements_ = new_num_elements;
     }
 }
 
-// *** 추가된 뷰 설정 함수 ***
 void GpuTensor::set_view(void* ptr, const std::vector<int>& new_dims, DataType type) {
-    free(); // 기존 메모리가 있다면 해제
+    free();
     d_ptr_ = ptr;
     dims_ = new_dims;
-    is_view_ = true; // 뷰 플래그 설정
+    is_view_ = true;
     dtype = type;
     element_size_ = (dtype == DataType::INT32) ? sizeof(int) : sizeof(float);
     num_elements_ = 1;
-    for(int dim : dims_) {
+    for (int dim : dims_) {
         num_elements_ *= dim;
     }
     allocated_ = (d_ptr_ != nullptr);
 }
 
-
 void GpuTensor::free() {
-    // *** 수정됨: 뷰가 아닐 경우에만 메모리 해제 ***
     if (allocated_ && d_ptr_ != nullptr && !is_view_) {
-        hipFree(d_ptr_);
+        hipError_t err = hipFree(d_ptr_);
+        if (err != hipSuccess && err != hipErrorDeinitialized) {
+            fprintf(stderr, "HIP Error on hipFree for tensor %s: %s\n", name_.c_str(), hipGetErrorString(err));
+        }
     }
     d_ptr_ = nullptr;
     allocated_ = false;
-    is_view_ = false;
     num_elements_ = 0;
 }
 
 void GpuTensor::zero_out(hipStream_t stream) {
-    if (allocated_ && d_ptr_ != nullptr) {
+    if (allocated_ && d_ptr_ != nullptr && num_elements_ > 0) {
         HIP_CHECK(hipMemsetAsync(d_ptr_, 0, size_in_bytes(), stream));
     }
 }
 
 template<typename T>
 void GpuTensor::to_gpu(const std::vector<T>& data) {
-    if (!allocated_ || data.size() != num_elements_) {
-        std::vector<int> current_dims = dims_.empty() ? std::vector<int>{(int)data.size()} : dims_;
-        allocate(current_dims);
-        if (data.size() != num_elements_) {
-            throw std::runtime_error("Tensor size mismatch for " + name_);
-        }
+    if (data.empty()) {
+        allocate({0});
+        return;
+    }
+    std::vector<int> current_dims = {(int)data.size()};
+    allocate(current_dims);
+
+    if (data.size() != num_elements_) {
+        throw std::runtime_error("Tensor size mismatch for " + name_);
     }
     HIP_CHECK(hipMemcpy(d_ptr_, data.data(), size_in_bytes(), hipMemcpyHostToDevice));
 }
 
 template<typename T>
 std::vector<T> GpuTensor::to_cpu() const {
-    if (!allocated_ || d_ptr_ == nullptr) {
-        throw std::runtime_error("Tensor " + name_ + " not allocated on GPU.");
+    if (!allocated_ || d_ptr_ == nullptr || num_elements_ == 0) {
+        return {};
     }
     std::vector<T> data(num_elements_);
     HIP_CHECK(hipMemcpy(data.data(), d_ptr_, size_in_bytes(), hipMemcpyDeviceToHost));
     return data;
 }
 
-// 명시적 템플릿 인스턴스화
+void GpuTensor::copy_from_gpu(const GpuTensor& src, hipStream_t stream) {
+    if (!src.is_allocated()) {
+        throw std::runtime_error("Source tensor " + src.name_ + " is not allocated for copy.");
+    }
+    allocate(src.dims_);
+    if (num_elements_ > 0) {
+        HIP_CHECK(hipMemcpyAsync(d_ptr_, src.d_ptr_, src.size_in_bytes(), hipMemcpyDeviceToDevice, stream));
+    }
+}
+
+// Explicit template instantiations
 template void GpuTensor::to_gpu<float>(const std::vector<float>& data);
 template std::vector<float> GpuTensor::to_cpu<float>() const;
 template void GpuTensor::to_gpu<int>(const std::vector<int>& data);
 template std::vector<int> GpuTensor::to_cpu<int>() const;
 
-void GpuTensor::copy_from_gpu(const GpuTensor& src, hipStream_t stream) {
-    if (!src.allocated_) {
-         throw std::runtime_error("Source tensor " + src.name_ + " is not allocated.");
-    }
-    if (!allocated_ || num_elements_ != src.num_elements_ || dtype != src.dtype) {
-        dtype = src.dtype;
-        allocate(src.dims_);
-    }
-    HIP_CHECK(hipMemcpyAsync(d_ptr_, src.d_ptr_, size_in_bytes(), hipMemcpyDeviceToDevice, stream));
-}
 
 // ============================================================================
 // Parameter Class Implementations
@@ -171,23 +184,23 @@ void Parameter::initialize_random(float mean, float stddev) {
 
     if (weights.is_allocated()) {
         std::vector<float> w_data(weights.num_elements_);
-        for(auto& val : w_data) val = dist(gen);
+        for (auto& val : w_data) val = dist(gen);
         weights.to_gpu(w_data);
     }
 
     if (has_bias_ && bias.is_allocated()) {
-        std::vector<float> b_data(bias.num_elements_, 0.0f); // Bias는 0으로 초기화
+        std::vector<float> b_data(bias.num_elements_, 0.0f);
         bias.to_gpu(b_data);
     }
 }
 
 void Parameter::allocate_gradients() {
     if (weights.is_allocated()) {
-        grad_weights.allocate(weights.dims_);
+        ensure_allocated(grad_weights, weights.dims_);
         grad_weights.name_ = name + "_gw";
     }
     if (has_bias_ && bias.is_allocated()) {
-        grad_bias.allocate(bias.dims_);
+        ensure_allocated(grad_bias, bias.dims_);
         grad_bias.name_ = name + "_gb";
     }
 }

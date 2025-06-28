@@ -1,44 +1,59 @@
 #ifndef HIP_KERNELS_HPP
 #define HIP_KERNELS_HPP
 
-#include "common_hip.hpp"
+// 개선 사항 9: include 순서 정리 (Standard -> Third-party -> Project)
+#include <cstddef>
+#include <cfloat> // For FLT_MAX
+#include <cmath>  // For M_PI_F
+
 #include <hip/hip_runtime.h>
 #include <hiprand/hiprand_kernel.h>
-#include <cstddef>
 
-// --- Constants ---
-constexpr int THREADS_PER_BLOCK_DEFAULT = 256;
-constexpr float M_PI_F = 3.14159265358979323846f;
+#include "common_hip.hpp"
 
-// RAII(Scope-Bound Resource Management)를 위한 간단한 GPU 포인터 배열 래퍼
-struct GpuPtrArray {
-    float** d_ptr_ = nullptr;
-    size_t count_ = 0;
-    hipStream_t stream_ = 0;
+#ifndef M_PI_F
+#define M_PI_F 3.14159265358979323846f
+#endif
 
-    GpuPtrArray(size_t count, hipStream_t stream = 0);
-    ~GpuPtrArray();
+// ============================================================================
+// Constants
+// ============================================================================
+// 개선 사항 8: 하드코딩된 상수/매직넘버 정의
+namespace KernelConstants {
+    constexpr int   THREADS_PER_BLOCK_DEFAULT = 256;
+    constexpr int   TRANSPOSE_BLOCK_DIM = 16; // Transpose 커널용 블록 크기
+    constexpr int   TRANSPOSE_BLOCK_DIM_X = 16;
+    constexpr int   TRANSPOSE_BLOCK_DIM_Y = 16;
+    constexpr float ATTENTION_MASK_VALUE = -1.0e4f; // 어텐션 마스크에 사용할 큰 음수
+}
 
-    // 복사 및 이동 생성/대입 연산자 삭제
-    GpuPtrArray(const GpuPtrArray&) = delete;
-    GpuPtrArray& operator=(const GpuPtrArray&) = delete;
-    GpuPtrArray(GpuPtrArray&&) = delete;
-    GpuPtrArray& operator=(GpuPtrArray&&) = delete;
-};
+// ============================================================================
+// Device-side Utility Functions
+// ============================================================================
+// 개선 사항 1: 중복 정의 제거 및 공통 헤더로 이동
+__device__ inline float gelu_fn_device(float x) {
+    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI_F) * (x + 0.044715f * x * x * x)));
+}
 
-// --- Kernel Launchers Declarations ---
+__device__ inline float gelu_grad_fn_device(float x) {
+    const float cdf_constant = 0.044715f;
+    const float sqrt_2_over_pi = sqrtf(2.0f / M_PI_F);
+    float x_cubed = x * x * x;
+    float inner = sqrt_2_over_pi * (x + cdf_constant * x_cubed);
+    float tanh_inner = tanhf(inner);
+    float sech_inner_sq = 1.0f - tanh_inner * tanh_inner;
+    float inner_derivative = sqrt_2_over_pi * (1.0f + 3.0f * cdf_constant * x * x);
+    return 0.5f * (1.0f + tanh_inner) + 0.5f * x * sech_inner_sq * inner_derivative;
+}
 
-// Batched GEMM Pointer Setup
-void launch_setup_batched_gemm_pointers(
-    hipStream_t stream,
-    GpuPtrArray& A_ptrs, GpuPtrArray& B_ptrs, GpuPtrArray& C_ptrs,
-    const GpuTensor& A_tensor, const GpuTensor& B_tensor, GpuTensor& C_tensor,
-    size_t batch_count);
+// ============================================================================
+// Kernel Launchers Declarations
+// ============================================================================
 
-// Dropout
+// Dropout (개선 사항 5: Philox RNG 사용)
 void launch_dropout_forward(
     hipStream_t stream, float* output, float* mask, const float* input,
-    size_t num_elements, float prob, float scale, unsigned long long seed);
+    size_t num_elements, float prob, float scale, unsigned long long seed, unsigned long long offset);
 
 void launch_dropout_backward(
     hipStream_t stream, float* grad_input, const float* grad_output, const float* mask,
@@ -50,8 +65,9 @@ void launch_layer_norm_forward_optimized(
     const float* inp, const float* gamma, const float* beta,
     int B, int C, float epsilon);
 
+// (개선 사항 6: AtomicAdd contention 회피)
 void launch_layer_norm_backward_optimized(
-    hipStream_t stream, float* grad_input, float* grad_gamma, float* grad_beta,
+    hipStream_t stream, float* grad_input, float* grad_gamma_part, float* grad_beta_part,
     const float* grad_output, const float* input,
     const float* gamma, const float* mean, const float* rstd,
     int B, int C);
@@ -60,6 +76,15 @@ void launch_layer_norm_backward_optimized(
 void launch_add_bias_gelu_kernel(
     hipStream_t stream, float* output, const float* input, const float* bias, int M, int N);
 
+// (개선 사항 6: AtomicAdd contention 회피)
+void launch_gelu_add_bias_backward_kernel(
+    hipStream_t stream,
+    float* grad_input_before_bias,
+    float* grad_bias_part, // 블록별 부분 합을 저장할 임시 공간
+    const float* grad_output_after_gelu,
+    const float* input_before_gelu,
+    int M, int N);
+
 void launch_gelu_backward_kernel(
     hipStream_t stream, float* grad_input, const float* grad_output, const float* input, size_t num_elements);
 
@@ -67,17 +92,13 @@ void launch_gelu_forward_kernel(
     hipStream_t stream, float* output, const float* input, size_t num_elements);
 
 // Reduction Kernels
-void launch_reduce_sum_axis0_add_kernel(
-    hipStream_t stream, float* out_grad, const float* in_grad, int M, int N);
-
-void launch_reduce_sum_axis1_add_kernel( // Added for completeness
-    hipStream_t stream, float* out_grad, const float* in_grad, int rows, int cols);
+void launch_reduce_sum_kernel(hipStream_t stream, float* out_vec, const float* in_matrix, int rows, int cols);
 
 // Softmax Cross Entropy Loss
 void launch_softmax_cross_entropy_loss_backward_optimized(
     hipStream_t stream, float* grad_logits, const float* logits,
     const int* labels, float* total_loss,
-    int B, int S, int V);
+    int B, int S, int V, int ignore_index);
 
 // AdamW Optimizer
 void launch_adamw_update_kernel(
@@ -88,9 +109,6 @@ void launch_adamw_update_kernel(
 void launch_add_bias_kernel(
     hipStream_t stream, float* output, const float* input, const float* bias, int M, int N);
 
-void launch_scale_kernel(
-    hipStream_t stream, float* data, float scale, size_t num_elements);
-
 // Embedding Kernels
 void launch_add_embeddings_kernel(
     hipStream_t stream, float* output, const int* input_ids, const int* token_type_ids,
@@ -98,11 +116,19 @@ void launch_add_embeddings_kernel(
     const float* token_type_embeddings, int batch_size, int seq_len,
     int hidden_size, int vocab_size, int max_position_embeddings);
 
+// (개선 사항 6: AtomicAdd contention 회피)
 void launch_embedding_backward_kernel(
-    hipStream_t stream, float* grad_word_embeddings, float* grad_position_embeddings,
-    float* grad_token_type_embeddings, const float* grad_output,
-    const int* input_ids, const int* token_type_ids,
-    int batch_size, int seq_len, int hidden_size);
+    hipStream_t stream, float* grad_word_embeddings,
+    const float* grad_output, const int* input_ids,
+    int B, int S, int H, int V);
+
+void launch_accumulate_positional_embedding_grad(
+    hipStream_t stream, float* grad_pos_embeddings, const float* grad_output, int B, int S, int H);
+
+void launch_accumulate_token_type_embedding_grad(
+    hipStream_t stream, float* grad_token_type_embeddings,
+    const float* grad_output, const int* token_type_ids,
+    int B, int S, int H);
 
 // Transpose Kernels for Attention
 void launch_transpose_for_scores_kernel(
@@ -113,16 +139,15 @@ void launch_transpose_back_kernel(
     hipStream_t stream, float* output, const float* input,
     int batch_size, int seq_len, int num_heads, int head_size);
 
-// Attention Kernels
+// Attention Kernels (개선 사항 4: 마스크 일반화)
 void launch_scale_and_mask_kernel(
     hipStream_t stream, float* attention_scores, const float* attention_mask,
-    int batch_size, int num_heads, int seq_len_q, int seq_len_k, float scale);
+    int B, int N, int Sq, int Sk, float scale);
 
 void launch_softmax_kernel(
     hipStream_t stream, float* output, const float* input,
     int M_rows, int N_softmax_dim);
 
-// *** 수정됨: 모호한 시그니처를 명시적으로 변경 ***
 void launch_softmax_backward_kernel(
     hipStream_t stream, float* grad_input, const float* grad_output, const float* output,
     int M_rows, int N_softmax_dim);
@@ -131,15 +156,15 @@ void launch_softmax_backward_kernel(
 void launch_elementwise_add_kernel(hipStream_t stream, float* out, const float* in1, const float* in2, size_t num_elements);
 void launch_accumulate_kernel(hipStream_t stream, float* target_and_out, const float* to_add, size_t num_elements);
 
-// Backward kernel for add_bias_gelu operation
-void launch_gelu_add_bias_backward_kernel(
-    hipStream_t stream,
-    float* grad_input_before_bias,
-    float* grad_bias,
-    const float* grad_output_after_gelu,
-    const float* input_before_gelu,
-    int M,
-    int N
-);
-
+// Element-wise Scale Kernel
+void launch_scale_kernel(hipStream_t stream, float* data, float scale_factor, size_t num_elements);
+void launch_set_identity_kernel(hipStream_t stream, float* matrix, int n);
+void launch_elementwise_scale_kernel(hipStream_t stream, float* data, float scale, size_t num_elements);
+void launch_elementwise_accumulate_kernel(hipStream_t stream, float* dst, const float* src, size_t num_elements);
+void launch_add_diagonal_value_kernel(hipStream_t stream, float* matrix, int n, float value);
+void launch_power_kernel(hipStream_t stream, float* data, float power, size_t num_elements);
+void launch_matrix_scale_columns_kernel(hipStream_t stream, float* output, const float* input, const float* scales, int rows, int cols);
+void launch_transpose_kernel(hipStream_t stream, float* dst, const float* src, int rows, int cols);
+void launch_adamw_update_kernel(hipStream_t stream, float* weights, const float* gradients, float* m, float* v, 
+                               float lr, float beta1, float beta2, float epsilon, float weight_decay, int t, size_t n);
 #endif // HIP_KERNELS_HPP
