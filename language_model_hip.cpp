@@ -164,7 +164,7 @@ CANBertForMaskedLM::~CANBertForMaskedLM() {
     if (stream_) {
         hipError_t err = hipStreamDestroy(stream_);
         if (err != hipSuccess) {
-            // Log error but don't throw in destructor
+             fprintf(stderr, "HIP Error: Failed to destroy stream in CANBertForMaskedLM destructor: %s\n", hipGetErrorString(err));
         }
     }
     if (blas_handle_) rocblas_destroy_handle(blas_handle_);
@@ -193,7 +193,7 @@ void CANBertForMaskedLM::train_step(const GpuTensor& input_ids,
     }
     // token_type_ids is optional, BertEmbeddings handles unallocated case by creating a dummy.
 
-    optimizer_->zero_grad(); // Zero out all parameter gradients
+     optimizer_->zero_grad(stream_); // Zero out all parameter gradients
 
     // --- Forward Pass ---
     BertModelCache model_cache(config_.num_hidden_layers); // num_hidden_layers from config
