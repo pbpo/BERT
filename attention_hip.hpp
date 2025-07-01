@@ -18,6 +18,20 @@ struct SelfAttentionCache {
     DenseCache q_dense_cache, k_dense_cache, v_dense_cache;
     DropoutCache attention_probs_dropout_cache;
     const GpuTensor* input_hidden_states = nullptr;
+    GpuTensor grad_context_reshaped;
+    GpuTensor grad_attention_probs;
+    GpuTensor grad_v_reshaped;
+    GpuTensor grad_scores;
+    GpuTensor grad_q_reshaped;
+    GpuTensor grad_k_reshaped;
+    GpuTensor grad_q_proj;
+    GpuTensor grad_k_proj;
+    GpuTensor grad_v_proj;
+    GpuTensor grad_temp_for_accumulation; 
+       GpuTensor cached_query_layer;
+    GpuTensor cached_key_layer;
+    GpuTensor cached_value_layer;
+    
 };
 
 struct BertAttentionCache {
@@ -25,7 +39,11 @@ struct BertAttentionCache {
     DenseCache output_dense_cache;
     DropoutCache output_dropout_cache;
     LayerNormCache output_layernorm_cache;
-    const GpuTensor* attention_input = nullptr;
+        GpuTensor attention_input;
+            GpuTensor grad_after_layernorm;
+    GpuTensor grad_after_dropout;
+    GpuTensor grad_after_dense;
+    GpuTensor cached_residual_sum_output;
 };
 
 // --- Class Definitions ---

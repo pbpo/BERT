@@ -16,35 +16,56 @@ struct BertEmbeddingsCache {
     GpuTensor embeddings_output;
     LayerNormCache layernorm_cache;
     DropoutCache dropout_cache;
+        GpuTensor dummy_token_type_ids_storage;
 };
 
+
+// bert_components_hip.hpp
+
 struct BertLayerCache {
-    BertAttentionCache attention_cache;
-    DenseCache ffn_intermediate_dense_cache;
-    DenseCache ffn_output_dense_cache;
-    DropoutCache ffn_output_dropout_cache;
-    LayerNormCache ffn_output_layernorm_cache;
-    
+    // --- Forward Pass Cache ---
     const GpuTensor* layer_input_ptr = nullptr;
     GpuTensor attention_output;
     GpuTensor intermediate_output;
     GpuTensor ffn_output_dense_result;
     GpuTensor ffn_residual_sum_output;
+    
+    // --- Sub-module Caches ---
+    BertAttentionCache attention_cache;
+    DenseCache ffn_intermediate_dense_cache;
+    DenseCache ffn_output_dense_cache;
+    DropoutCache ffn_output_dropout_cache;
+    LayerNormCache ffn_output_layernorm_cache;
+
+    // [NEW] Backward Pass를 위한 임시 텐서들
+    GpuTensor grad_ffn_sum_input;
+    GpuTensor grad_ffn_dropout_output;
+    GpuTensor grad_attention_block_output;
+    GpuTensor grad_intermediate_output;
+    GpuTensor grad_ffn_input;
 };
+// bert_components_hip.hpp
 
 struct BertEncoderCache {
     std::vector<BertLayerCache> layer_caches;
-};
+    
+    // [NEW] Encoder의 forward pass 중간 결과들을 저장할 텐서
+    // 두 개의 버퍼를 번갈아 가며 사용 (ping-pong buffer)
+    GpuTensor hidden_states_buffer1;
+    GpuTensor hidden_states_buffer2;
 
+    BertEncoderCache(int num_layers) : layer_caches(num_layers) {}
+};
 struct BertModelCache {
     BertEmbeddingsCache embeddings_cache;
     BertEncoderCache encoder_cache;
-    
-    BertModelCache(int num_layers) {
-        encoder_cache.layer_caches.resize(num_layers);
+    BertModelCache(int num_layers)
+        // [FIXED] 멤버 초기화 리스트를 사용하여 encoder_cache를 올바르게 초기화
+        : encoder_cache(num_layers) 
+    {
+        // 생성자 본문은 비어있어도 됨
     }
 };
-
 // --- Classes ---
 class BertEmbeddings {
 private:

@@ -5,7 +5,7 @@
 #include "bert_config.hpp"
 #include <vector>
 #include <string>
-
+#include <iomanip> 
 // --- Cache Structs ---
 struct DropoutCache {
     GpuTensor mask;
@@ -16,8 +16,10 @@ struct DenseCache {
 };
 
 struct LayerNormCache {
-    const GpuTensor* input = nullptr;
-    GpuTensor normalized_input;
+    // [FIXED] backward에 필요한 mean과 rstd를 저장할 GpuTensor
+    GpuTensor mean;
+    GpuTensor rstd;
+   std::vector<int> input_dims; 
 };
 
 struct GeluCache {
@@ -62,19 +64,24 @@ public:
                   GpuTensor& grad_input);
 };
 
-class LayerNorm {
-private:
-    Parameter gamma;
-    Parameter beta;
-    float eps_;
 
+class LayerNorm : public Parameter {
 public:
-    LayerNorm(const BertConfig& config, const std::string& name_prefix);
-    LayerNorm(int hidden_size, float eps = 1e-12f, const std::string& name_prefix = "LayerNorm");
-    std::vector<Parameter*> get_parameters();
-    void allocate_gradients();
-    void forward(hipStream_t stream, const GpuTensor& input, GpuTensor& output, LayerNormCache& cache);
-    void backward(hipStream_t stream, const GpuTensor& grad_output, const LayerNormCache& cache, GpuTensor& grad_input);
-};
+    // [FIXED] 생성자 선언을 (int, float, string)으로 통일
+    LayerNorm(int hidden_size, float eps, const std::string& name_prefix);
 
+    // [FIXED] 간단한 함수는 헤더에 바로 구현 (inline)
+    std::vector<Parameter*> get_parameters() {
+        return {this};
+    }
+
+    // [NEW] 누락되었던 함수 선언 추가
+    void forward(hipStream_t stream, const GpuTensor& input, GpuTensor& output, LayerNormCache& cache);
+   // original_input 파라미터를 추가하여 .cpp 파일의 정의와 동일하게 맞춰줍니다.
+void backward(hipStream_t stream, const GpuTensor& grad_output, const GpuTensor& original_input, const LayerNormCache& cache, GpuTensor& grad_input);
+    void allocate_gradients();
+
+private:
+    float eps_;
+};
 #endif // NN_LAYERS_HIP_HPP

@@ -16,12 +16,16 @@ struct BertLMPredictionHeadCache {
     GpuTensor transform_dense_output;
     GpuTensor transform_gelu_output; 
     GpuTensor transform_layernorm_output; 
-
+  // [NEW] backward pass 임시 텐서들을 캐시에 추가
+    GpuTensor grad_transform_layernorm_output;
+    GpuTensor grad_transform_gelu_output;
+    GpuTensor grad_transform_dense_output;
     // Caches for sub-modules (nn_layers_hip.hpp의 이름과 일치)
     DenseCache transform_dense_cache;          // DenseLayerCache → DenseCache
     GeluCache transform_gelu_cache; 
     LayerNormCache transform_layernorm_cache;
     
+/*************  ✨ Windsurf Command ⭐  *************/
     void clear() {
         hidden_states_input = nullptr;
         transform_dense_output.free();
@@ -54,7 +58,7 @@ public:
                   const GpuTensor& grad_logits, BertLMPredictionHeadCache& cache,
                   GpuTensor& grad_hidden_states);
 };
-
+//AIzaSyD7UYylod_NPMQSBPFqdzGDJKkh0G34ew8
 // --- CANBertForMaskedLM 클래스 ---
 class CANBertForMaskedLM {
 private:
@@ -62,9 +66,16 @@ private:
     std::unique_ptr<BertModel> bert_model_;
     std::unique_ptr<BertLMPredictionHead> lm_head_;
     std::unique_ptr<AdamWOptimizer> optimizer_;
-    rocblas_handle blas_handle_;
-    hipStream_t stream_;
+void ensure_internal_buffers(int B, int S);
+    hipStream_t stream_ = nullptr;
+    rocblas_handle blas_handle_ = nullptr;
+    std::vector<Parameter*> all_params_; 
 
+    // [NEW] 학습 단계에서 반복적으로 사용되는 텐서들을 멤버 변수로 관리하여 성능 향상
+    GpuTensor sequence_output_;
+    GpuTensor logits_;
+    GpuTensor grad_logits_;
+    GpuTensor grad_sequence_output_;
 public:
     CANBertForMaskedLM(const BertConfig& cfg);
     ~CANBertForMaskedLM();

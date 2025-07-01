@@ -12,7 +12,7 @@ struct BertConfig {
     int intermediate_size = 3072; // Size of the FFN intermediate layer (4 * hidden_size)
     int max_position_embeddings = 512;
     int type_vocab_size = 2; // For segment token embeddings (e.g., sentence A vs B)
-
+ int default_max_batch   = 32;
     // Activation
     std::string hidden_act = "gelu";
 

@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cfloat> // For FLT_MAX
 #include <cmath>  // For M_PI_F
-
+#include <iostream>
 #include <hip/hip_runtime.h>
 #include <hiprand/hiprand_kernel.h>
 
@@ -14,7 +14,12 @@
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
 #endif
-
+#define HIP_LAUNCH_KERNEL(KERNEL_NAME, GRID, BLOCK, SHM, STREAM, ...)           \
+    do {                                                                        \
+        std::cout << "[KERNEL LAUNCH] " << #KERNEL_NAME << std::endl;           \
+        hipLaunchKernelGGL(KERNEL_NAME, GRID, BLOCK, SHM, STREAM, __VA_ARGS__); \
+        HIP_CHECK(hipGetLastError());                                           \
+    } while (0)
 // ============================================================================
 // Constants
 // ============================================================================
@@ -31,20 +36,6 @@ namespace KernelConstants {
 // Device-side Utility Functions
 // ============================================================================
 // 개선 사항 1: 중복 정의 제거 및 공통 헤더로 이동
-__device__ inline float gelu_fn_device(float x) {
-    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI_F) * (x + 0.044715f * x * x * x)));
-}
-
-__device__ inline float gelu_grad_fn_device(float x) {
-    const float cdf_constant = 0.044715f;
-    const float sqrt_2_over_pi = sqrtf(2.0f / M_PI_F);
-    float x_cubed = x * x * x;
-    float inner = sqrt_2_over_pi * (x + cdf_constant * x_cubed);
-    float tanh_inner = tanhf(inner);
-    float sech_inner_sq = 1.0f - tanh_inner * tanh_inner;
-    float inner_derivative = sqrt_2_over_pi * (1.0f + 3.0f * cdf_constant * x * x);
-    return 0.5f * (1.0f + tanh_inner) + 0.5f * x * sech_inner_sq * inner_derivative;
-}
 
 // ============================================================================
 // Kernel Launchers Declarations
@@ -167,4 +158,11 @@ void launch_matrix_scale_columns_kernel(hipStream_t stream, float* output, const
 void launch_transpose_kernel(hipStream_t stream, float* dst, const float* src, int rows, int cols);
 void launch_adamw_update_kernel(hipStream_t stream, float* weights, const float* gradients, float* m, float* v, 
                                float lr, float beta1, float beta2, float epsilon, float weight_decay, int t, size_t n);
+                               void launch_add_bias_only_kernel(
+    hipStream_t     stream,
+    float*          output,     // in-place 가능
+    const float*    input,
+    const float*    bias,       // [N]
+    int             M,          // rows
+    int             N);         // cols
 #endif // HIP_KERNELS_HPP

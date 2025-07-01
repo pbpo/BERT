@@ -1,79 +1,85 @@
-// 개선 사항 9: include 순서 정리 (Standard -> Third-party -> Project)
-#include <algorithm> // For std::min, std::max
-#include <cfloat>    // For FLT_MAX
+// =============================================================================
+// hip_kernels.cpp — High-Performance, Safe HIP Kernel Implementations
+// =============================================================================
 
-#include "hip_kernels.hpp"
+#include "hip_kernels.hpp" // 프로젝트 헤더
+#include <iomanip>  // std::setprecision
+#include <algorithm> // std::min
+// ============================================================================
+// Device-side Utility & Reduction Functions
+// ============================================================================
 
-// ============================================================================
-// Device-side Reduction Helpers
-// ============================================================================
-// 개선 사항 2: __shfl_down -> __shfl_down_sync
-__device__ float warpReduceSum(float val) {
-    const int all_lanes = 0xFFFFFFFF;
-    for (int offset = warpSize/2; offset > 0; offset /= 2) {
-        val += __shfl_down(val, offset);  // _sync 제거
+__device__ inline float gelu_fn_device(float x) {
+    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI_F) * (x + 0.044715f * x * x * x)));
+}
+__device__ inline float gelu_grad_fn_device(float x) {
+    const float cdf_constant = 0.044715f;
+    const float sqrt_2_over_pi = sqrtf(2.0f / M_PI_F);
+    float x_cubed = x * x * x;
+    float inner = sqrt_2_over_pi * (x + cdf_constant * x_cubed);
+    float tanh_inner = tanhf(inner);
+    float sech_inner_sq = 1.0f - tanh_inner * tanh_inner;
+    float inner_derivative = sqrt_2_over_pi * (1.0f + 3.0f * cdf_constant * x * x);
+    return 0.5f * (1.0f + tanh_inner) + 0.5f * x * sech_inner_sq * inner_derivative;
+}
+
+__device__ inline float warpReduceSum(float val) {
+    #pragma unroll
+    for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+        val += __shfl_down(val, offset);
     }
     return val;
 }
 
-__device__ float warpReduceMax(float val) {
-    const int all_lanes = 0xFFFFFFFF;
-    for (int offset = warpSize/2; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down(val, offset));  // _sync 제거
+__device__ inline float warpReduceMax(float val) {
+    #pragma unroll
+    for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down(val, offset));
     }
     return val;
 }
 
 __device__ inline float blockReduceSum(float val) {
-    // 개선 사항 3: 공유 메모리 크기 산정
-    extern __shared__ float s_warp_sums[];
-    int lane = threadIdx.x % warpSize;
-    int warp_id = threadIdx.x / warpSize;
+    extern __shared__ float smem[];
+    const int lane    = threadIdx.x & (warpSize - 1);
+    const int warp_id = threadIdx.x / warpSize;
 
     val = warpReduceSum(val);
 
-    if (lane == 0) {
-        s_warp_sums[warp_id] = val;
-    }
+    if (lane == 0) smem[warp_id] = val;
     __syncthreads();
 
-    val = (threadIdx.x < (blockDim.x / warpSize)) ? s_warp_sums[lane] : 0.0f;
-    if (warp_id == 0) {
-        val = warpReduceSum(val);
-    }
+    val = (threadIdx.x < (blockDim.x / warpSize)) ? smem[lane] : 0.0f;
+    if (warp_id == 0) val = warpReduceSum(val);
     return val;
 }
 
 __device__ inline float blockReduceMax(float val) {
-    extern __shared__ float s_warp_maxes[];
-    int lane = threadIdx.x % warpSize;
-    int warp_id = threadIdx.x / warpSize;
+    extern __shared__ float smem[];
+    const int lane    = threadIdx.x & (warpSize - 1);
+    const int warp_id = threadIdx.x / warpSize;
 
     val = warpReduceMax(val);
-
-    if (lane == 0) {
-        s_warp_maxes[warp_id] = val;
-    }
+    if (lane == 0) smem[warp_id] = val;
     __syncthreads();
 
-    val = (threadIdx.x < (blockDim.x / warpSize)) ? s_warp_maxes[lane] : -FLT_MAX;
-    if (warp_id == 0) {
-        val = warpReduceMax(val);
-    }
+    val = (threadIdx.x < (blockDim.x / warpSize)) ? smem[lane] : -FLT_MAX;
+    if (warp_id == 0) val = warpReduceMax(val);
     return val;
 }
 
 
 // ============================================================================
-// HIP Kernel Implementations
+// Kernel Implementations
 // ============================================================================
-__global__ void dropout_forward_kernel_impl(float* output, const float* input, float* mask,
-                                     size_t num_elements, float prob, float scale,
+
+__global__ void dropout_forward_kernel_impl(float* __restrict__ output, float* __restrict__ mask,
+                                     const float* __restrict__ input, size_t num_elements,
+                                     float prob, float scale,
                                      unsigned long long seed, unsigned long long offset) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_elements) return;
 
-    // 개선 사항 5: Philox RNG 사용으로 성능 향상
     hiprandStatePhilox4_32_10_t state;
     hiprand_init(seed, idx, offset, &state);
 
@@ -87,23 +93,21 @@ __global__ void dropout_forward_kernel_impl(float* output, const float* input, f
     }
 }
 
-__global__ void dropout_backward_kernel_impl(float* grad_input, const float* grad_output,
-                                        const float* mask, size_t num_elements, float scale) {
+__global__ void dropout_backward_kernel_impl(float* __restrict__ grad_input, const float* __restrict__ grad_output,
+                                        const float* __restrict__ mask, size_t num_elements, float scale) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_elements) {
         grad_input[idx] = grad_output[idx] * mask[idx] * scale;
     }
 }
 
-
-__global__ void layer_norm_forward_kernel_warp_optimized_impl(
-    float* out, float* mean_out, float* rstd_out,
-    const float* inp, const float* gamma, const float* beta,
+__global__ void layer_norm_forward_kernel_optimized_impl(
+    float* __restrict__ out, float* __restrict__ mean_out, float* __restrict__ rstd_out,
+    const float* __restrict__ inp, const float* __restrict__ gamma, const float* __restrict__ beta,
     int B, int C, float epsilon)
 {
     extern __shared__ float shared_data[];
     float* s_warp_results = shared_data;
-    // 개선 사항 3: s_broadcast_params의 위치를 정확히 계산
     float* s_broadcast_params = &s_warp_results[(blockDim.x + warpSize - 1) / warpSize];
 
     int b = blockIdx.x;
@@ -111,9 +115,7 @@ __global__ void layer_norm_forward_kernel_warp_optimized_impl(
     float* out_b = out + b * C;
 
     float thread_sum = 0.0f;
-    for (int i = threadIdx.x; i < C; i += blockDim.x) {
-        thread_sum += inp_b[i];
-    }
+    for (int i = threadIdx.x; i < C; i += blockDim.x) thread_sum += inp_b[i];
     float total_sum = blockReduceSum(thread_sum);
 
     float mean;
@@ -148,11 +150,10 @@ __global__ void layer_norm_forward_kernel_warp_optimized_impl(
     }
 }
 
-// 개선 사항 6: atomicAdd 경쟁을 피하기 위해 부분 합(partial sum) 사용
 __global__ void layer_norm_backward_kernel_optimized_impl(
-    float* grad_input, float* grad_gamma_part, float* grad_beta_part,
-    const float* grad_output, const float* input,
-    const float* gamma, const float* mean, const float* rstd,
+    float* __restrict__ grad_input, float* __restrict__ grad_gamma_part, float* __restrict__ grad_beta_part,
+    const float* __restrict__ grad_output, const float* __restrict__ input,
+    const float* __restrict__ gamma, const float* __restrict__ mean, const float* __restrict__ rstd,
     int B, int C)
 {
     extern __shared__ float shared_data[];
@@ -169,9 +170,7 @@ __global__ void layer_norm_backward_kernel_optimized_impl(
     float* grad_gamma_b = grad_gamma_part + b * C;
     float* grad_beta_b = grad_beta_part + b * C;
 
-    float sum1_thread = 0.0f;
-    float sum2_thread = 0.0f;
-
+    float sum1_thread = 0.0f, sum2_thread = 0.0f;
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         const float x_hat_i = (input_b[i] - mean_b) * rstd_b;
         const float dL_dy_i = grad_output_b[i];
@@ -182,7 +181,6 @@ __global__ void layer_norm_backward_kernel_optimized_impl(
         sum1_thread += dL_dy_gamma_i;
         sum2_thread += dL_dy_gamma_i * x_hat_i;
     }
-    __syncthreads();
 
     const float sum1 = blockReduceSum(sum1_thread);
     const float sum2 = blockReduceSum(sum2_thread);
@@ -198,8 +196,7 @@ __global__ void layer_norm_backward_kernel_optimized_impl(
 
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         const float x_hat_i = (input_b[i] - mean_b) * rstd_b;
-        const float dL_dy_i = grad_output_b[i];
-        const float dL_dy_gamma_i = dL_dy_i * gamma[i];
+        const float dL_dy_gamma_i = grad_output_b[i] * gamma[i];
         float dL_dx_i = dL_dy_gamma_i - c1 - (x_hat_i * c2);
         grad_input_b[i] = rstd_b * dL_dx_i;
     }
@@ -208,19 +205,25 @@ __global__ void layer_norm_backward_kernel_optimized_impl(
 __global__ void add_bias_gelu_kernel_impl(float* output, const float* input, const float* bias, int M, int N) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-
     if (row < M && col < N) {
         int idx = row * N + col;
-        float val = input[idx] + bias[col];
-        output[idx] = gelu_fn_device(val);
+        output[idx] = gelu_fn_device(input[idx] + bias[col]);
     }
 }
 
+__global__ void add_bias_only_kernel_impl(float* out, const float* in, const float* bias, int M, int N)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < N) {
+        out[row * N + col] = in[row * N + col] + bias[col];
+    }
+}
+
+
 __global__ void gelu_add_bias_backward_kernel_impl(
-    float* grad_input_before_bias,
-    float* grad_bias_part,
-    const float* grad_output_after_gelu,
-    const float* input_before_gelu,
+    float* grad_input_before_bias, float* grad_bias_part,
+    const float* grad_output_after_gelu, const float* input_before_gelu,
     int M, int N)
 {
     extern __shared__ float sdata[];
@@ -228,7 +231,6 @@ __global__ void gelu_add_bias_backward_kernel_impl(
     int tid_y = threadIdx.y;
     
     float my_sum = 0.0f;
-
     if (col < N) {
         for (int row = tid_y; row < M; row += blockDim.y) {
             int idx = row * N + col;
@@ -241,9 +243,7 @@ __global__ void gelu_add_bias_backward_kernel_impl(
     __syncthreads();
     
     for (unsigned int s = blockDim.y / 2; s > 0; s >>= 1) {
-        if (tid_y < s) {
-            sdata[tid_y] += sdata[tid_y + s];
-        }
+        if (tid_y < s) sdata[tid_y] += sdata[tid_y + s];
         __syncthreads();
     }
 
@@ -266,43 +266,27 @@ __global__ void gelu_forward_kernel_impl(float* output, const float* input, size
     }
 }
 
-__global__ void reduce_sum_kernel_impl(float* out_vec, const float* in_matrix, int rows, int cols) {
-    extern __shared__ float sdata[];
-    int j = blockIdx.x; // column index, which is the target index in out_vec
-    int tid = threadIdx.x;
+__global__ void reduce_sum_optimized_impl(float* out_vec, const float* in_matrix, int rows, int cols) {
+    int col_idx = blockIdx.x;
+    if (col_idx >= cols) return;
+    
+    const float* col_ptr = in_matrix + col_idx;
+    float thread_sum = 0.0f;
 
-    float sum = 0.0f;
-    if (j < cols) {
-        for (int i = tid; i < rows; i += blockDim.x) {
-            sum += in_matrix[i * cols + j];
-        }
+    for (int i = threadIdx.x; i < rows; i += blockDim.x) {
+        thread_sum += col_ptr[i * cols];
     }
-    sdata[tid] = sum;
-    __syncthreads();
+    
+    float total_col_sum = blockReduceSum(thread_sum);
 
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0 && j < cols) {
-        out_vec[j] = sdata[0];
+    if (threadIdx.x == 0) {
+        out_vec[col_idx] = total_col_sum;
     }
 }
 
-__global__ void scale_kernel_impl(float* data, float scale_factor, size_t num_elements) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_elements) {
-        data[idx] *= scale_factor;
-    }
-}
-
-__global__ void softmax_cross_entropy_loss_backward_kernel_optimized_impl(
+__global__ void softmax_cross_entropy_loss_backward_optimized_impl(
     float* grad_logits, const float* logits, const int* labels,
     float* total_loss, int B, int S, int V, int ignore_index) {
-
     extern __shared__ float shared_data[];
     float* s_warp_results = shared_data;
     float* s_broadcast_params = &s_warp_results[(blockDim.x + warpSize - 1) / warpSize];
@@ -321,9 +305,7 @@ __global__ void softmax_cross_entropy_loss_backward_kernel_optimized_impl(
     }
 
     float thread_max = -FLT_MAX;
-    for (int i = tid; i < V; i += blockDim.x) {
-        thread_max = fmaxf(thread_max, logits[seq_idx * V + i]);
-    }
+    for (int i = tid; i < V; i += blockDim.x) thread_max = fmaxf(thread_max, logits[seq_idx * V + i]);
     float max_logit = blockReduceMax(thread_max);
 
     if (tid == 0) s_broadcast_params[0] = max_logit;
@@ -331,9 +313,7 @@ __global__ void softmax_cross_entropy_loss_backward_kernel_optimized_impl(
     max_logit = s_broadcast_params[0];
 
     float thread_sum_exp = 0.0f;
-    for (int i = tid; i < V; i += blockDim.x) {
-        thread_sum_exp += expf(logits[seq_idx * V + i] - max_logit);
-    }
+    for (int i = tid; i < V; i += blockDim.x) thread_sum_exp += expf(logits[seq_idx * V + i] - max_logit);
     float sum_exp = blockReduceSum(thread_sum_exp);
 
     if (tid == 0) {
@@ -345,7 +325,7 @@ __global__ void softmax_cross_entropy_loss_backward_kernel_optimized_impl(
     __syncthreads();
     sum_exp = s_broadcast_params[0];
 
-    const float inv_sum_exp = 1.0f / sum_exp;
+    const float inv_sum_exp = 1.0f / fmaxf(sum_exp, 1e-9f);
     for (int i = tid; i < V; i += blockDim.x) {
         const float prob = expf(logits[seq_idx * V + i] - max_logit) * inv_sum_exp;
         const float grad = (i == label_val) ? (prob - 1.0f) : prob;
@@ -361,10 +341,8 @@ __global__ void adamw_update_kernel_impl(float* params, const float* grads, floa
         float p = params[idx];
         const float g = grads[idx];
 
-        // Decoupled weight decay
         p -= lr * weight_decay * p;
 
-        // Adam update
         float m_t = beta1 * m[idx] + (1.0f - beta1) * g;
         float v_t = beta2 * v[idx] + (1.0f - beta2) * g * g;
         m[idx] = m_t;
@@ -402,28 +380,27 @@ __global__ void add_embeddings_kernel_impl(float* output, const int* input_ids, 
     }
 }
 
-__global__ void embedding_backward_kernel_impl(
+__global__ void embedding_backward_atomic_impl(
     float* grad_word_embeddings, const float* grad_output,
-    const int* input_ids, int B, int S, int H, int V) {
-    
-    int word_id = blockIdx.x; // 각 블록이 하나의 단어 ID 담당
-    int h_tid = threadIdx.x;  // 각 스레드가 hidden 차원 담당
-    
-    if (word_id < V && h_tid < H) {
-        float sum = 0.0f;
-        for (int i = 0; i < B * S; ++i) {
-            if (input_ids[i] == word_id) {
-                sum += grad_output[i * H + h_tid];
-            }
-        }
-        grad_word_embeddings[word_id * H + h_tid] = sum;
+    const int* input_ids, size_t num_tokens, int H) 
+{
+    size_t token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token_idx >= num_tokens) return;
+
+    int word_id = input_ids[token_idx];
+    if (word_id < 0) return;
+
+    const float* grad_out_vec = grad_output + token_idx * H;
+    float* grad_word_emb_vec = grad_word_embeddings + (size_t)word_id * H;
+
+    for (int h = 0; h < H; ++h) {
+        atomicAdd(&grad_word_emb_vec[h], grad_out_vec[h]);
     }
 }
 
-
 __global__ void accumulate_positional_embedding_grad_impl(
-    float* grad_pos_embeddings, const float* grad_output,
-    int B, int S, int H) {
+    float* grad_pos_embeddings, const float* grad_output, int B, int S, int H)
+{
     int pos_id = blockIdx.x;
     int h_tid = threadIdx.x;
 
@@ -440,7 +417,7 @@ __global__ void accumulate_token_type_embedding_grad_impl(
     float* grad_token_type_embeddings, const float* grad_output,
     const int* token_type_ids, int B, int S, int H)
 {
-    int type_id = blockIdx.x; // 0 or 1
+    int type_id = blockIdx.x;
     int h_tid = threadIdx.x;
 
     if (type_id < 2 && h_tid < H) {
@@ -481,11 +458,10 @@ __global__ void transpose_back_kernel_impl(float* output, const float* input,
         int a_in = h_flat_idx % A;
         int input_idx = ((b * N + n_in) * S + s) * A + a_in;
         int output_idx = (b * S + s) * (N * A) + h_flat_idx;
-        output[output_idx] = input[input_idx];
+        output[output_idx] = input[output_idx];
     }
 }
 
-// 개선 사항 4: 마스크 일반화 (간단한 버전 유지)
 __global__ void scale_and_mask_kernel_impl(float* scores, const float* mask,
                                      int B, int N, int Sq, int Sk, float scale) {
     int b = blockIdx.x;
@@ -495,8 +471,8 @@ __global__ void scale_and_mask_kernel_impl(float* scores, const float* mask,
 
     if (b < B && n < N && sq < Sq && sk < Sk) {
         int score_idx = ((b * N + n) * Sq + sq) * Sk + sk;
-        int mask_idx = b * Sk + sk; // [B, 1, 1, Sk] 브로드캐스팅 가정
-        scores[score_idx] = scores[score_idx] * scale + mask[mask_idx];
+        float add_val = (mask != nullptr) ? mask[b * Sk + sk] : 0.0f;
+        scores[score_idx] = scores[score_idx] * scale + add_val;
     }
 }
 
@@ -504,43 +480,24 @@ __global__ void softmax_kernel_impl(float* output, const float* input, int M, in
     extern __shared__ float sdata[];
     int row_idx = blockIdx.x;
     int tid = threadIdx.x;
-
     if (row_idx >= M) return;
+
     const float* row_input = input + row_idx * N_softmax_dim;
     float* row_output = output + row_idx * N_softmax_dim;
 
     float max_val = -FLT_MAX;
-    for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
-        max_val = fmaxf(max_val, row_input[i]);
-    }
-    sdata[tid] = max_val;
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-        __syncthreads();
-    }
-    max_val = sdata[0];
+    for (int i = tid; i < N_softmax_dim; i += blockDim.x) max_val = fmaxf(max_val, row_input[i]);
+    max_val = blockReduceMax(max_val);
 
     float sum_exp = 0.0f;
-    for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
-        sum_exp += expf(row_input[i] - max_val);
-    }
-    sdata[tid] = sum_exp;
-    __syncthreads();
+    for (int i = tid; i < N_softmax_dim; i += blockDim.x) sum_exp += expf(row_input[i] - max_val);
+    sum_exp = blockReduceSum(sum_exp);
 
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    sum_exp = sdata[0];
     sum_exp = fmaxf(sum_exp, 1e-9f);
-
     for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
         row_output[i] = expf(row_input[i] - max_val) / sum_exp;
     }
 }
-
 
 __global__ void softmax_backward_kernel_impl(
     float* grad_input, const float* grad_output, const float* output,
@@ -549,23 +506,15 @@ __global__ void softmax_backward_kernel_impl(
     extern __shared__ float sdata[];
     int row_idx = blockIdx.x;
     int tid = threadIdx.x;
-
     if (row_idx >= M) return;
+
     const float* row_grad_output = grad_output + row_idx * N_softmax_dim;
     const float* row_output = output + row_idx * N_softmax_dim;
     float* row_grad_input = grad_input + row_idx * N_softmax_dim;
 
     float sum_val = 0.0f;
-    for (int j = tid; j < N_softmax_dim; j += blockDim.x) {
-        sum_val += row_grad_output[j] * row_output[j];
-    }
-    sdata[tid] = sum_val;
-    __syncthreads();
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    sum_val = sdata[0];
+    for (int j = tid; j < N_softmax_dim; j += blockDim.x) sum_val += row_grad_output[j] * row_output[j];
+    sum_val = blockReduceSum(sum_val);
 
     for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
         row_grad_input[i] = row_output[i] * (row_grad_output[i] - sum_val);
@@ -574,21 +523,67 @@ __global__ void softmax_backward_kernel_impl(
 
 __global__ void elementwise_add_kernel_impl(float* out, const float* in1, const float* in2, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        out[idx] = in1[idx] + in2[idx];
-    }
+    if (idx < n) out[idx] = in1[idx] + in2[idx];
 }
 
 __global__ void accumulate_kernel_impl(float* target_and_out, const float* to_add, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // idx가 n보다 작은 경우에만 누적 연산 수행
     if (idx < n) {
-        target_and_out[idx] += to_add[idx];
+        target_and_out[idx] += to_add[idx];  // 누적 연산
+    }
+}
+
+
+__global__ void scale_kernel_impl(float* data, float scale_factor, size_t num_elements) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) data[idx] *= scale_factor;
+}
+
+__global__ void set_identity_kernel_impl(float* matrix, int n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < (size_t)n) matrix[idx * n + idx] = 1.0f;
+}
+
+__global__ void elementwise_scale_kernel_impl(float* data, float scale, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) data[idx] *= scale;
+}
+
+__global__ void elementwise_accumulate_kernel_impl(float* dst, const float* src, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] += src[idx];
+}
+
+__global__ void add_diagonal_value_kernel_impl(float* matrix, int n, float value) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < (size_t)n) matrix[idx * n + idx] += value;
+}
+
+__global__ void power_kernel_impl(float* data, float power, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) data[idx] = powf(data[idx], power);
+}
+
+__global__ void matrix_scale_columns_corrected_impl(float* output, const float* input, const float* scales, int rows, int cols) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)rows * cols) return;
+    int c = idx % cols;
+    output[idx] = input[idx] * scales[c];
+}
+
+__global__ void transpose_kernel(float* dst, const float* src, int rows, int cols) {
+    int r = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows && c < cols) {
+        dst[c * rows + r] = src[r * cols + c];
     }
 }
 
 
 // ============================================================================
-// Kernel Launcher Functions
+// Kernel Launcher Implementations (Optimized)
 // ============================================================================
 void launch_dropout_forward(
     hipStream_t stream, float* output, float* mask, const float* input,
@@ -597,9 +592,8 @@ void launch_dropout_forward(
     if (num_elements == 0) return;
     dim3 block_dim(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
-    hipLaunchKernelGGL(dropout_forward_kernel_impl, grid_dim, block_dim, 0, stream,
-                       output, input, mask, num_elements, prob, scale, seed, offset);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(dropout_forward_kernel_impl, grid_dim, block_dim, 0, stream,
+                       output, mask, input, num_elements, prob, scale, seed, offset);
 }
 
 void launch_dropout_backward(
@@ -609,9 +603,8 @@ void launch_dropout_backward(
     if (num_elements == 0) return;
     dim3 block_dim(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
-    hipLaunchKernelGGL(dropout_backward_kernel_impl, grid_dim, block_dim, 0, stream,
+    HIP_LAUNCH_KERNEL(dropout_backward_kernel_impl, grid_dim, block_dim, 0, stream,
                        grad_input, grad_output, mask, num_elements, scale);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_layer_norm_forward_optimized(
@@ -623,9 +616,8 @@ void launch_layer_norm_forward_optimized(
     dim3 grid(B);
     dim3 block(std::min(C, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
     size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float) + 2 * sizeof(float);
-    hipLaunchKernelGGL(layer_norm_forward_kernel_warp_optimized_impl, grid, block, shared_mem_size, stream,
+    HIP_LAUNCH_KERNEL(layer_norm_forward_kernel_optimized_impl, grid, block, shared_mem_size, stream,
                        out, mean, rstd, inp, gamma, beta, B, C, epsilon);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_layer_norm_backward_optimized(
@@ -634,22 +626,31 @@ void launch_layer_norm_backward_optimized(
     const float* gamma, const float* mean, const float* rstd,
     int B, int C)
 {
+    printf("Launching layer_norm_backward_optimized with B=%d, C=%d\n", B, C);
+
     if (B == 0 || C == 0) return;
-    dim3 grid(B);
-    dim3 block(std::min(C, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float) * 2;
-    hipLaunchKernelGGL(layer_norm_backward_kernel_optimized_impl, grid, block, shared_mem_size, stream,
+
+    // 배치 차원과 채널 차원 분리
+    int block_size = std::min(C, KernelConstants::THREADS_PER_BLOCK_DEFAULT); // 채널에 맞는 스레드 수
+    dim3 block(block_size);
+    dim3 grid((B + block.x - 1) / block.x);  // 배치 차원을 나누어서 grid 크기 설정
+
+    size_t shared_mem_size = (block.x + warpSize - 1) / warpSize * sizeof(float) * 2;
+    
+    // 커널 호출
+    HIP_LAUNCH_KERNEL(layer_norm_backward_kernel_optimized_impl, grid, block, shared_mem_size, stream,
                        grad_input, grad_gamma_part, grad_beta_part,
                        grad_output, input, gamma, mean, rstd, B, C);
-    HIP_CHECK(hipGetLastError());
+
+    printf("Finished launching layer_norm_backward_optimized\n");
 }
+
 
 void launch_add_bias_gelu_kernel(hipStream_t stream, float* output, const float* input, const float* bias, int M, int N) {
     if(M==0||N==0)return;
     dim3 threads(KernelConstants::TRANSPOSE_BLOCK_DIM_X, KernelConstants::TRANSPOSE_BLOCK_DIM_Y);
     dim3 grid((N + threads.x - 1) / threads.x, (M + threads.y - 1) / threads.y);
-    hipLaunchKernelGGL(add_bias_gelu_kernel_impl, grid, threads, 0, stream, output, input, bias, M, N);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(add_bias_gelu_kernel_impl, grid, threads, 0, stream, output, input, bias, M, N);
 }
 
 void launch_gelu_add_bias_backward_kernel(
@@ -662,38 +663,39 @@ void launch_gelu_add_bias_backward_kernel(
 {
     if (M == 0 || N == 0) return;
     dim3 threads(1, 256);
-    dim3 grid(N, 1); // Launch one block per feature in bias.
+    dim3 grid(N, 1);
     size_t shared_mem_size = threads.y * sizeof(float);
-    hipLaunchKernelGGL(gelu_add_bias_backward_kernel_impl, grid, threads, shared_mem_size, stream,
+    HIP_LAUNCH_KERNEL(gelu_add_bias_backward_kernel_impl, grid, threads, shared_mem_size, stream,
                        grad_input_before_bias, grad_bias_part,
-                       grad_output_after_gelu, input_before_gelu,
-                       M, N);
-    HIP_CHECK(hipGetLastError());
+                       grad_output_after_gelu, input_before_gelu, M, N);
 }
 
 void launch_gelu_backward_kernel(hipStream_t stream, float* grad_input, const float* grad_output, const float* input, size_t num_elements) {
     if(num_elements==0)return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid((num_elements+block.x-1)/block.x);
-    hipLaunchKernelGGL(gelu_backward_kernel_impl,grid,block,0,stream,grad_input,grad_output,input,num_elements);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(gelu_backward_kernel_impl, grid, block, 0, stream, grad_input, grad_output, input, num_elements);
 }
 
 void launch_gelu_forward_kernel(hipStream_t stream, float* output, const float* input, size_t num_elements) {
     if(num_elements==0)return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid((num_elements+block.x-1)/block.x);
-    hipLaunchKernelGGL(gelu_forward_kernel_impl,grid,block,0,stream,output,input,num_elements);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(gelu_forward_kernel_impl, grid, block, 0, stream, output, input, num_elements);
 }
 
 void launch_reduce_sum_kernel(hipStream_t stream, float* out_vec, const float* in_matrix, int rows, int cols) {
     if (rows == 0 || cols == 0) return;
-    dim3 grid(cols);
-    dim3 block(std::min(rows, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    size_t shared_mem_size = block.x * sizeof(float);
-    hipLaunchKernelGGL(reduce_sum_kernel_impl, grid, block, shared_mem_size, stream, out_vec, in_matrix, rows, cols);
-    HIP_CHECK(hipGetLastError());
+
+    // 그리드와 블록 크기 설정
+    dim3 grid(cols);  // 열 단위로 그리드 크기 설정
+    dim3 block(std::min(rows, KernelConstants::THREADS_PER_BLOCK_DEFAULT));  // 행 단위로 블록 크기 설정
+
+    // 공유 메모리 크기 설정 (최적화)
+    size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float);
+
+    // 커널 실행
+    HIP_LAUNCH_KERNEL(reduce_sum_optimized_impl, grid, block, shared_mem_size, stream, out_vec, in_matrix, rows, cols);
 }
 
 void launch_softmax_cross_entropy_loss_backward_optimized(
@@ -705,38 +707,36 @@ void launch_softmax_cross_entropy_loss_backward_optimized(
     dim3 grid(B, S);
     dim3 block(std::min(V, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
     size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float) + 2 * sizeof(float);
-    hipLaunchKernelGGL(softmax_cross_entropy_loss_backward_kernel_optimized_impl, grid, block, shared_mem_size, stream,
+    HIP_LAUNCH_KERNEL(softmax_cross_entropy_loss_backward_optimized_impl, grid, block, shared_mem_size, stream,
                        grad_logits, logits, labels, total_loss, B, S, V, ignore_index);
-    HIP_CHECK(hipGetLastError());
 }
 
-void launch_adamw_update_kernel(hipStream_t stream, float* weights, float* gradients, float* m, float* v, 
-                               float lr, float beta1, float beta2, float epsilon, float weight_decay, int t, size_t n) {
-    dim3 bl(KernelConstants::THREADS_PER_BLOCK_DEFAULT), gr((n+bl.x-1)/bl.x);
-    hipLaunchKernelGGL(adamw_update_kernel_impl, gr, bl, 0, stream, weights, gradients, m, v, lr, beta1, beta2, epsilon, weight_decay, t, n);  // _impl 추가
-    HIP_CHECK(hipGetLastError());
-}
-
-void launch_adamw_update_kernel(hipStream_t stream, float* weights, const float* gradients, float* m, float* v, 
-                               float lr, float beta1, float beta2, float epsilon, float weight_decay, int t, size_t n) {
-    if (n == 0) return;
-    
+void launch_adamw_update_kernel(hipStream_t stream, float* params, const float* grads, float* m, float* v,
+                               float lr, float beta1, float beta2, float eps, float weight_decay, int t, size_t n) {
+    if (n==0) return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid((n + block.x - 1) / block.x);
-    
-    hipLaunchKernelGGL(adamw_update_kernel_impl, grid, block, 0, stream, 
-                       weights, gradients, m, v, lr, beta1, beta2, epsilon, weight_decay, t, n);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(adamw_update_kernel_impl, grid, block, 0, stream,
+                       params, grads, m, v, lr, beta1, beta2, eps, weight_decay, t, n);
 }
+
 void launch_add_bias_kernel(
     hipStream_t stream, float* output, const float* input, const float* bias, int M, int N)
 {
     if (M == 0 || N == 0) return;
     dim3 threads(KernelConstants::TRANSPOSE_BLOCK_DIM_X, KernelConstants::TRANSPOSE_BLOCK_DIM_Y);
     dim3 grid((N + threads.x - 1) / threads.x, (M + threads.y - 1) / threads.y);
-    hipLaunchKernelGGL(add_bias_gelu_kernel_impl, grid, threads, 0, stream, output, input, bias, M, N);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(add_bias_gelu_kernel_impl, grid, threads, 0, stream, output, input, bias, M, N);
 }
+
+void launch_add_bias_only_kernel(hipStream_t stream, float* output, const float* input, const float* bias, int M, int N)
+{
+    if (M == 0 || N == 0) return;
+    dim3 block(KernelConstants::TRANSPOSE_BLOCK_DIM_X, KernelConstants::TRANSPOSE_BLOCK_DIM_Y);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    HIP_LAUNCH_KERNEL(add_bias_only_kernel_impl, grid, block, 0, stream, output, input, bias, M, N);
+}
+
 
 void launch_add_embeddings_kernel(
     hipStream_t stream, float* output, const int* input_ids, const int* token_type_ids,
@@ -747,10 +747,9 @@ void launch_add_embeddings_kernel(
     if (batch_size == 0 || seq_len == 0 || hidden_size == 0) return;
     dim3 grid(batch_size, seq_len);
     dim3 block(std::min(hidden_size, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    hipLaunchKernelGGL(add_embeddings_kernel_impl, grid, block, 0, stream,
+    HIP_LAUNCH_KERNEL(add_embeddings_kernel_impl, grid, block, 0, stream,
                        output, input_ids, token_type_ids, word_embeddings, position_embeddings,
                        token_type_embeddings, batch_size, seq_len, hidden_size, vocab_size, max_position_embeddings);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_embedding_backward_kernel(
@@ -758,12 +757,13 @@ void launch_embedding_backward_kernel(
     const float* grad_output, const int* input_ids,
     int B, int S, int H, int V)
 {
-    if (B * S * H * V == 0) return;
-    dim3 grid(V);
-    dim3 block(std::min(H, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    hipLaunchKernelGGL(embedding_backward_kernel_impl, grid, block, 0, stream,
-                       grad_word_embeddings, grad_output, input_ids, B, S, H, V);
-    HIP_CHECK(hipGetLastError());
+    if (B * S == 0) return;
+    size_t num_tokens = (size_t)B * S;
+    dim3 block(256);
+    dim3 grid((num_tokens + block.x - 1) / block.x);
+    
+    HIP_LAUNCH_KERNEL(embedding_backward_atomic_impl, grid, block, 0, stream,
+                       grad_word_embeddings, grad_output, input_ids, num_tokens, H);
 }
 
 void launch_accumulate_positional_embedding_grad(
@@ -772,9 +772,8 @@ void launch_accumulate_positional_embedding_grad(
     if (B*S*H == 0) return;
     dim3 grid(S);
     dim3 block(std::min(H, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    hipLaunchKernelGGL(accumulate_positional_embedding_grad_impl, grid, block, 0, stream,
+    HIP_LAUNCH_KERNEL(accumulate_positional_embedding_grad_impl, grid, block, 0, stream,
                        grad_pos_embeddings, grad_output, B, S, H);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_accumulate_token_type_embedding_grad(
@@ -783,11 +782,10 @@ void launch_accumulate_token_type_embedding_grad(
     int B, int S, int H)
 {
     if (B*S*H == 0) return;
-    dim3 grid(2); // For token type 0 and 1
+    dim3 grid(2);
     dim3 block(std::min(H, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    hipLaunchKernelGGL(accumulate_token_type_embedding_grad_impl, grid, block, 0, stream,
+    HIP_LAUNCH_KERNEL(accumulate_token_type_embedding_grad_impl, grid, block, 0, stream,
                        grad_token_type_embeddings, grad_output, token_type_ids, B, S, H);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_transpose_for_scores_kernel(
@@ -797,13 +795,10 @@ void launch_transpose_for_scores_kernel(
     if (batch_size * seq_len * num_heads * head_size == 0) return;
     int hidden_size = num_heads * head_size;
     dim3 grid(batch_size, seq_len);
-    // 개선 사항 10: 블록 크기를 warpSize 배수로 조정
-    int block_dim = (hidden_size + warpSize - 1) / warpSize * warpSize;
-    block_dim = std::min(block_dim, KernelConstants::THREADS_PER_BLOCK_DEFAULT);
+    int block_dim = std::min(hidden_size, KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 block(block_dim);
-    hipLaunchKernelGGL(transpose_for_scores_kernel_impl, grid, block, 0, stream,
+    HIP_LAUNCH_KERNEL(transpose_for_scores_kernel_impl, grid, block, 0, stream,
                        output, input, batch_size, seq_len, num_heads, head_size);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_transpose_back_kernel(
@@ -813,12 +808,10 @@ void launch_transpose_back_kernel(
     if (batch_size * seq_len * num_heads * head_size == 0) return;
     int hidden_size = num_heads * head_size;
     dim3 grid(batch_size, seq_len);
-    int block_dim = (hidden_size + warpSize - 1) / warpSize * warpSize;
-    block_dim = std::min(block_dim, KernelConstants::THREADS_PER_BLOCK_DEFAULT);
+    int block_dim = std::min(hidden_size, KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 block(block_dim);
-    hipLaunchKernelGGL(transpose_back_kernel_impl, grid, block, 0, stream,
+    HIP_LAUNCH_KERNEL(transpose_back_kernel_impl, grid, block, 0, stream,
                        output, input, batch_size, seq_len, num_heads, head_size);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_scale_and_mask_kernel(
@@ -828,9 +821,8 @@ void launch_scale_and_mask_kernel(
     if (B * N * Sq * Sk == 0) return;
     dim3 grid(B, N, Sq);
     dim3 block(std::min(Sk, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    hipLaunchKernelGGL(scale_and_mask_kernel_impl, grid, block, 0, stream,
+    HIP_LAUNCH_KERNEL(scale_and_mask_kernel_impl, grid, block, 0, stream,
                        attention_scores, attention_mask, B, N, Sq, Sk, scale);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_softmax_kernel(
@@ -840,10 +832,9 @@ void launch_softmax_kernel(
     if (M_rows == 0 || N_softmax_dim == 0) return;
     dim3 grid(M_rows);
     dim3 block(std::min(N_softmax_dim, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    size_t shared_mem_size = block.x * sizeof(float);
-    hipLaunchKernelGGL(softmax_kernel_impl, grid, block, shared_mem_size, stream,
+    size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float);
+    HIP_LAUNCH_KERNEL(softmax_kernel_impl, grid, block, shared_mem_size, stream,
                        output, input, M_rows, N_softmax_dim);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_softmax_backward_kernel(
@@ -853,143 +844,161 @@ void launch_softmax_backward_kernel(
     if (M_rows == 0 || N_softmax_dim == 0) return;
     dim3 grid(M_rows);
     dim3 block(std::min(N_softmax_dim, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    size_t shared_mem_size = block.x * sizeof(float);
-    hipLaunchKernelGGL(softmax_backward_kernel_impl, grid, block, shared_mem_size, stream,
+    size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float);
+    HIP_LAUNCH_KERNEL(softmax_backward_kernel_impl, grid, block, shared_mem_size, stream,
                        grad_input, grad_output, output, M_rows, N_softmax_dim);
-    HIP_CHECK(hipGetLastError());
 }
 
 void launch_elementwise_add_kernel(hipStream_t stream, float* out, const float* in1, const float* in2, size_t num_elements) {
     if (num_elements == 0) return;
     dim3 block_dim(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
-    hipLaunchKernelGGL(elementwise_add_kernel_impl, grid_dim, block_dim, 0, stream, out, in1, in2, num_elements);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(elementwise_add_kernel_impl, grid_dim, block_dim, 0, stream, out, in1, in2, num_elements);
 }
-void launch_scale_kernel(hipStream_t s, float* data, float scale_factor, size_t n) {
-    if(n==0)return;
-    dim3 bl(KernelConstants::THREADS_PER_BLOCK_DEFAULT), gr((n+bl.x-1)/bl.x);  // KernelConstants:: 추가
-    hipLaunchKernelGGL(scale_kernel_impl,gr,bl,0,s,data,scale_factor,n);
-    HIP_CHECK(hipGetLastError());
+
+__host__ void validate_memory_access(float* ptr, size_t size, const char* name) {
+    hipPointerAttribute_t attr;
+    hipError_t err = hipPointerGetAttributes(&attr, ptr);
+    
+    if (err != hipSuccess) {
+        printf("[ERROR] %s: 포인터 속성 조회 실패: %s\n", name, hipGetErrorString(err));
+        return;
+    }
+    
+    printf("[MEMORY] %s: ptr=%p, type=%d, device=%d\n", 
+           name, ptr, attr.type, attr.device);
+    
+    // 메모리 범위 검사
+    char test_byte;
+    err = hipMemcpy(&test_byte, ptr, 1, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        printf("[ERROR] %s: 메모리 읽기 실패 (시작): %s\n", name, hipGetErrorString(err));
+    }
+    
+    err = hipMemcpy(&test_byte, ptr + size - 1, 1, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        printf("[ERROR] %s: 메모리 읽기 실패 (끝): %s\n", name, hipGetErrorString(err));
+    }
 }
 void launch_accumulate_kernel(hipStream_t stream, float* target_and_out, const float* to_add, size_t num_elements) {
     if (num_elements == 0) return;
+    
+    std::cout << "[DEBUG] accumulate_kernel 시작" << std::endl;
+    std::cout << "[DEBUG] num_elements = " << num_elements << std::endl;
+    std::cout << "[DEBUG] target_and_out pointer = " << target_and_out << std::endl;
+    std::cout << "[DEBUG] to_add pointer = " << to_add << std::endl;
+    
+    // 입력 값 확인 (처음 10개)
+    float* host_target = new float[std::min(num_elements, (size_t)10)];
+    float* host_to_add = new float[std::min(num_elements, (size_t)10)];
+    
+    HIP_CHECK(hipMemcpy(host_target, target_and_out, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(host_to_add, to_add, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
+    
+    std::cout << "[DEBUG] 커널 실행 전 값들:" << std::endl;
+    for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
+        std::cout << "[DEBUG] target[" << i << "] = " << std::fixed << std::setprecision(6) << host_target[i] << std::endl;
+    }
+    for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
+        std::cout << "[DEBUG] to_add[" << i << "] = " << std::fixed << std::setprecision(6) << host_to_add[i] << std::endl;
+    }
+    
+    // 블록과 그리드 크기 계산
     dim3 block_dim(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid_dim((num_elements + block_dim.x - 1) / block_dim.x);
-    hipLaunchKernelGGL(accumulate_kernel_impl, grid_dim, block_dim, 0, stream, target_and_out, to_add, num_elements);
-    HIP_CHECK(hipGetLastError());
-}
-// ...existing code...
-
-// Additional kernel implementations
-__global__ void set_identity_kernel_impl(float* matrix, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n * n) {
-        int row = idx / n;
-        int col = idx % n;
-        matrix[idx] = (row == col) ? 1.0f : 0.0f;
+    
+    // 메모리 유효성 검사
+    size_t bytes = num_elements * sizeof(float);
+    validate_memory_access(target_and_out, bytes, "target_and_out");
+    validate_memory_access((float*)to_add, bytes, "to_add");
+    
+    std::cout << "[DEBUG] grid_dim = " << grid_dim.x << ", block_dim = " << block_dim.x << std::endl;
+    
+    // 커널 실행
+    std::cout << "[DEBUG] accumulate_kernel_impl 실행 중..." << std::endl;
+    HIP_LAUNCH_KERNEL(accumulate_kernel_impl, grid_dim, block_dim, 0, stream, 
+                       target_and_out, to_add, num_elements);
+    
+    // 동기화
+    HIP_CHECK(hipStreamSynchronize(stream));
+    std::cout << "[DEBUG] 커널 실행 완료" << std::endl;
+    
+    // 결과 확인 (처음 10개)
+    float* host_result = new float[std::min(num_elements, (size_t)10)];
+    HIP_CHECK(hipMemcpy(host_result, target_and_out, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
+    
+    std::cout << "[DEBUG] 커널 실행 후 결과:" << std::endl;
+    for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
+        std::cout << "[DEBUG] result[" << i << "] = " << std::fixed << std::setprecision(6) << host_result[i] 
+                  << " (expected: " << (host_target[i] + host_to_add[i]) << ")" << std::endl;
     }
+    
+    // 메모리 해제
+    delete[] host_target;
+    delete[] host_to_add;
+    delete[] host_result;
+    
+    std::cout << "[DEBUG] accumulate_kernel 완료" << std::endl;
 }
 
-__global__ void elementwise_scale_kernel_impl(float* data, float scale, size_t n) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        data[idx] *= scale;
-    }
-}
 
-__global__ void elementwise_accumulate_kernel_impl(float* dst, const float* src, size_t n) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] += src[idx];
-    }
-}
 
-__global__ void add_diagonal_value_kernel_impl(float* matrix, int n, float value) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        matrix[idx * n + idx] += value;
-    }
-}
 
-__global__ void power_kernel_impl(float* data, float power, size_t n) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        data[idx] = powf(data[idx], power);
-    }
-}
-__global__ void matrix_scale_columns_kernel(float* output, const float* input, const float* scales, int rows, int cols) {
-    __shared__ float scale_shared[KernelConstants::TRANSPOSE_BLOCK_DIM_X]; // assuming cols <= 1024
 
-    int tx = threadIdx.x;
-    int col = blockIdx.x * blockDim.x + tx;
 
-    // Load shared memory
-    if (col < cols && threadIdx.y == 0) {
-        scale_shared[tx] = scales[col];
-    }
-    __syncthreads();
-
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    if (row < rows && col < cols) {
-        int idx = row * cols + col;
-        output[idx] = input[idx] * scale_shared[tx];
-    }
-}
-__global__ void transpose_kernel(float* dst, const float* src, int rows, int cols) {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows && j < cols) {
-        dst[j * rows + i] = src[i * cols + j];
-    }
-}
-// Launcher functions
-void launch_set_identity_kernel(hipStream_t stream, float* matrix, int n) {
+void launch_scale_kernel(hipStream_t stream, float* data, float scale_factor, size_t n) {
+    if(n==0)return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
-    dim3 grid((n * n + block.x - 1) / block.x);
-    hipLaunchKernelGGL(set_identity_kernel_impl, grid, block, 0, stream, matrix, n);
-    HIP_CHECK(hipGetLastError());
+    dim3 grid((n + block.x - 1) / block.x);
+    HIP_LAUNCH_KERNEL(scale_kernel_impl, grid, block, 0, stream, data, scale_factor, n);
+}
+
+void launch_set_identity_kernel(hipStream_t stream, float* matrix, int n) {
+    if (n==0) return;
+    dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
+    dim3 grid((n + block.x - 1) / block.x);
+    HIP_LAUNCH_KERNEL(set_identity_kernel_impl, grid, block, 0, stream, matrix, n);
 }
 
 void launch_elementwise_scale_kernel(hipStream_t stream, float* data, float scale, size_t num_elements) {
+    if (num_elements == 0) return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid((num_elements + block.x - 1) / block.x);
-    hipLaunchKernelGGL(elementwise_scale_kernel_impl, grid, block, 0, stream, data, scale, num_elements);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(elementwise_scale_kernel_impl, grid, block, 0, stream, data, scale, num_elements);
 }
 
 void launch_elementwise_accumulate_kernel(hipStream_t stream, float* dst, const float* src, size_t num_elements) {
+    if (num_elements == 0) return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid((num_elements + block.x - 1) / block.x);
-    hipLaunchKernelGGL(elementwise_accumulate_kernel_impl, grid, block, 0, stream, dst, src, num_elements);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(elementwise_accumulate_kernel_impl, grid, block, 0, stream, dst, src, num_elements);
 }
 
 void launch_add_diagonal_value_kernel(hipStream_t stream, float* matrix, int n, float value) {
+    if (n==0) return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid((n + block.x - 1) / block.x);
-    hipLaunchKernelGGL(add_diagonal_value_kernel_impl, grid, block, 0, stream, matrix, n, value);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(add_diagonal_value_kernel_impl, grid, block, 0, stream, matrix, n, value);
 }
 
 void launch_power_kernel(hipStream_t stream, float* data, float power, size_t num_elements) {
+    if(num_elements==0)return;
     dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 grid((num_elements + block.x - 1) / block.x);
-    hipLaunchKernelGGL(power_kernel_impl, grid, block, 0, stream, data, power, num_elements);
-    HIP_CHECK(hipGetLastError());
+    HIP_LAUNCH_KERNEL(power_kernel_impl, grid, block, 0, stream, data, power, num_elements);
 }
 
 void launch_matrix_scale_columns_kernel(hipStream_t stream, float* output, const float* input, const float* scales, int rows, int cols) {
-    constexpr int TILE_DIM = 16;
-    dim3 blockDim(TILE_DIM, TILE_DIM);
-    dim3 gridDim((cols + TILE_DIM - 1) / TILE_DIM, (rows + TILE_DIM - 1) / TILE_DIM);
-
-    hipLaunchKernelGGL(matrix_scale_columns_kernel, gridDim, blockDim, 0, stream, output, input, scales, rows, cols);
+    if (rows == 0 || cols == 0) return;
+    size_t num_elements = (size_t)rows * cols;
+    dim3 block(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
+    dim3 grid((num_elements + block.x - 1) / block.x);
+    HIP_LAUNCH_KERNEL(matrix_scale_columns_corrected_impl, grid, block, 0, stream, output, input, scales, rows, cols);
 }
 
-
 void launch_transpose_kernel(hipStream_t stream, float* dst, const float* src, int rows, int cols) {
-    dim3 block(16, 16);
-    dim3 grid((cols + 15) / 16, (rows + 15) / 16);
-    hipLaunchKernelGGL(transpose_kernel, grid, block, 0, stream, dst, src, rows, cols);
+    if (rows==0 || cols==0) return;
+    dim3 block(KernelConstants::TRANSPOSE_BLOCK_DIM_X, KernelConstants::TRANSPOSE_BLOCK_DIM_Y);
+    dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
+    HIP_LAUNCH_KERNEL(transpose_kernel, grid, block, 0, stream, dst, src, rows, cols);
 }

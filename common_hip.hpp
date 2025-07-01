@@ -1,12 +1,12 @@
 #ifndef COMMON_HIP_HPP
 #define COMMON_HIP_HPP
 
-// 개선 사항 9: include 순서 정리
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <sstream> // dims_string()을 위해 추가
 
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
@@ -46,11 +46,15 @@ public:
     bool allocated_ = false;
     DataType dtype = DataType::FLOAT32;
     bool is_view_ = false;
-
+void allocate_if_smaller(const std::vector<int>& new_dims);
     GpuTensor(const std::string& name = "");
     GpuTensor(const std::vector<int>& dimensions, const std::string& name = "", DataType type = DataType::FLOAT32);
-    ~GpuTensor() noexcept; // 개선 사항: 소멸자에서 예외가 발생하지 않도록 noexcept 명시
-
+    ~GpuTensor() noexcept; // 소멸자에서 예외가 발생하지 않도록 noexcept 명시
+    static size_t count_elements(const std::vector<int>& dims) {
+        size_t n = 1;
+        for (int d : dims) n *= static_cast<size_t>(d);
+        return n;
+    }
     GpuTensor(const GpuTensor&) = delete;
     GpuTensor& operator=(const GpuTensor&) = delete;
 
@@ -71,10 +75,27 @@ public:
     size_t size_in_bytes() const { return num_elements_ * element_size_; }
     bool is_allocated() const { return allocated_; }
     int dim_size(int i) const { return dims_.at(i); }
+
+    /**
+     * @brief [추가된 함수] 텐서의 차원 정보를 문자열로 반환합니다.
+     * @return "[dim1, dim2, ...]" 형식의 문자열
+     */
+    std::string dims_string() const {
+        if (dims_.empty()) {
+            return "[]";
+        }
+        std::stringstream ss;
+        ss << "[";
+        for (size_t i = 0; i < dims_.size(); ++i) {
+            ss << dims_[i] << (i == dims_.size() - 1 ? "" : ", ");
+        }
+        ss << "]";
+        return ss.str();
+    }
 };
 
 /**
- * @brief [개선 사항 7] 텐서가 할당되었는지 확인하고, 필요 시 새로 할당하는 헬퍼 함수.
+ * @brief 텐서가 할당되었는지 확인하고, 필요 시 새로 할당하는 헬퍼 함수.
  * @param t 검사할 GpuTensor.
  * @param new_dims 원하는 텐서 차원.
  * @param stream HIP 스트림.
@@ -107,4 +128,4 @@ public:
     void allocate_gradients();
 };
 
-#endif
+#endif // COMMON_HIP_HPP
