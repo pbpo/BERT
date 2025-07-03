@@ -349,7 +349,7 @@ AdamWOptimizer::AdamWOptimizer(std::vector<Parameter*>& params, float lr, float 
             m_states_.at(w_ptr).zero_out(stream);
             v_states_.at(w_ptr).zero_out(stream);
         }
-        if (p->has_bias_ && p->bias.is_allocated()) {
+        if (p->has_bias_flag() && p->bias.is_allocated()) {
             const GpuTensor* b_ptr = &p->bias;
             m_states_[b_ptr].allocate(b_ptr->dims_);
             v_states_[b_ptr].allocate(b_ptr->dims_);
@@ -375,7 +375,7 @@ void AdamWOptimizer::step(hipStream_t stream) {
                 lr_, beta1_, beta2_, epsilon_, weight_decay_, t_, w_ptr->num_elements_);
         }
 
-        if (p->has_bias_ && p->bias.is_allocated() && p->grad_bias.is_allocated()) {
+        if (p->has_bias_flag() && p->bias.is_allocated() && p->grad_bias.is_allocated()) {
              const GpuTensor* b_ptr = &p->bias;
              launch_adamw_update_kernel(stream,
                 (float*)p->bias.d_ptr_,
@@ -393,7 +393,7 @@ void AdamWOptimizer::zero_grad(hipStream_t stream) {
             if (p_param->grad_weights.is_allocated()) {
                 p_param->grad_weights.zero_out(stream);
             }
-            if (p_param->has_bias_ && p_param->grad_bias.is_allocated()) {
+            if (p_param->has_bias_flag() && p_param->grad_bias.is_allocated()) {
                 p_param->grad_bias.zero_out(stream);
             }
         }

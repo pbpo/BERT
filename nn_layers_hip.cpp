@@ -260,16 +260,16 @@ std::cout << "Grad output dims: " << grad_output.dims_.size() << " dimensions" <
     std::cout << "계산된 차원: K=" << K << ", N=" << N << ", M=" << M << std::endl;
     std::cout << "=================================" << std::endl;
     // grad_weights 계산
-    ROCBLAS_CHECK(rocblas_sgemm(
+    ROCBLAS_CHECK( rocblas_sgemm(
         blas_handle,
-        rocblas_operation_transpose,
-        rocblas_operation_none,
+        rocblas_operation_transpose, // Xᵀ : K×M
+        rocblas_operation_none,      // dY : M×N
         K, N, M,
         &alpha,
-        (const float*)cache.input->d_ptr_, M,  // input 크기 맞춤
-        (const float*)grad_output.d_ptr_, M,   // grad_output 크기 맞춤
+        (const float*)cache.input->d_ptr_,  M,   // lda = M
+        (const float*)grad_output.d_ptr_,   M,   // ldb = M
         &beta,
-        (float*)weights.grad_weights.d_ptr_, N  // grad_weights 크기 맞춤
+        (float*)weights.grad_weights.d_ptr_, K   // ldc = K (row-major)
     ));
 
     // grad_bias = reduce_sum(grad_output) over M rows
@@ -312,96 +312,121 @@ LayerNorm::LayerNorm(int hidden_size, float eps,
 // LayerNorm::forward 구현 (이전 답변의 올바른 버전)
 void LayerNorm::forward(hipStream_t stream,
                         const GpuTensor& input,
-                        
                         GpuTensor& output,
                         LayerNormCache& cache) {
+
+    // --- ① 파라미터(가중치) 및 출력 텐서 메모리 할당 ---
+    int C_cols = input.dims_.back();
+
+    // [FIX] 커널이 사용하기 전에 파라미터가 할당되어 있는지 확인 및 할당
+    // 이 파라미터들은 모델 로딩 시점에 미리 할당되는 것이 이상적입니다.
+    if (!weights.is_allocated()) {
+        weights.allocate({C_cols});
+        // weights.load_from_file(...) or other initialization
+    }
+    if (!bias.is_allocated()) {
+        bias.allocate({C_cols});
+        // bias.load_from_file(...) or other initialization
+    }
+
     output.allocate(input.dims_);
 
+    // --- ② 역전파를 위한 캐시 메모리 할당 ---
     size_t B_rows = 1;
     for (size_t i = 0; i < input.dims_.size() - 1; ++i) {
         B_rows *= input.dim_size(i);
     }
-    int C_cols = input.dims_.back();
 
-   cache.input_dims = input.dims_;
+    cache.input_dims = input.dims_; // 역전파 시 사용하기 위해 입력 차원 저장
     cache.mean.allocate({(int)B_rows});
     cache.rstd.allocate({(int)B_rows});
+    // [FIX] 불필요한 allocate_if_smaller 제거
 
+    // --- ③ 커널 실행 ---
+    // 모든 메모리 할당이 완료된 후 커널을 실행합니다.
     launch_layer_norm_forward_optimized(
         stream,
         (float*)output.d_ptr_,
         (float*)cache.mean.d_ptr_,
         (float*)cache.rstd.d_ptr_,
         (const float*)input.d_ptr_,
-        (const float*)weights.d_ptr_, // 'gamma' 대신 'weights' 사용
-        (const float*)bias.d_ptr_,   // 'beta' 대신 'bias' 사용
+        (const float*)weights.d_ptr_, // 'gamma'
+        (const float*)bias.d_ptr_,   // 'beta'
         static_cast<int>(B_rows),
         C_cols,
-        eps_
-    );if (!weights.is_allocated()) weights.allocate({C_cols});
-if (!bias.is_allocated())    bias.allocate({C_cols});
-    cache.mean.allocate_if_smaller({(int)B_rows});
-cache.rstd.allocate_if_smaller({(int)B_rows});
+        1e-5 // Epsilon 값 전달
+    );
 }
 
 // [FIXED] Parameter 멤버를 올바르게 사용하는 backward 구현
+// [FINAL FIXED] LayerNorm::backward 최종 수정 코드
 void LayerNorm::backward(hipStream_t stream,
                          const GpuTensor& grad_output,
-                         const GpuTensor& original_input, // <-- 순전파 때의 입력 텐서를 직접 받음
+                         const GpuTensor& original_input,
                          const LayerNormCache& cache,
-                         GpuTensor& grad_input){
+                         GpuTensor& grad_input) {
 
-/* ① γ·β의 gradient 버퍼 강제 확보 */
-if (!grad_weights.is_allocated())
-    grad_weights.allocate(weights.dims_);   //  (hidden_size)
-if (!grad_bias.is_allocated())
-    grad_bias.allocate(bias.dims_);         //  (hidden_size)
+    assert(original_input.dims_ == cache.input_dims && "Mismatched dimensions!");
 
-/* ② 초기값 0-fill (옵션) */
-grad_weights.zero_out(stream);
-grad_bias.zero_out(stream);
+    // 최종 그래디언트 버퍼 확보 ([C] 크기)
+    if (!grad_weights.is_allocated()) grad_weights.allocate(weights.dims_);
+    if (!grad_bias.is_allocated())    grad_bias.allocate(bias.dims_);
 
-
+    // 차원 계산
     size_t B_rows = 1;
-       for (size_t i = 0; i < cache.input_dims.size() - 1; ++i) {   // <--- 이렇게 변경
-        B_rows *= cache.input_dims[i]; // dim_size(i) 대신 직접 접근
+    for (size_t i = 0; i < cache.input_dims.size() - 1; ++i) {
+        B_rows *= cache.input_dims[i];
     }
-     int C_cols = cache.input_dims.back();
-auto log_ptr = [](const char* tag, const GpuTensor& t) {
-    std::cout << "  " << std::left << std::setw(10) << tag
-              << " ptr=" << t.d_ptr_
-              << " bytes=" << (size_t)t.num_elements_ * t.element_size_
-              << std::endl;
-};
+    int C_cols = cache.input_dims.back();
 
-std::cout << "\n[LayerNorm BACKWARD] B=" << B_rows << ", C=" << C_cols << '\n';
-log_ptr("grad_out",  grad_output);
+    // =================================================================
+    // [STEP 1] 커널이 사용할 임시 그래디언트 버퍼를 [B, C] 크기로 할당
+    // =================================================================
+    GpuTensor partial_grad_gamma;
+    partial_grad_gamma.allocate({(int)B_rows, C_cols});
 
-        // weights (size C)
-log_ptr("mean",      cache.mean);
-log_ptr("rstd",      cache.rstd);
-log_ptr("grad_in",   grad_input);
-log_ptr("gamma",     weights);        // 실제 γ
-log_ptr("grad_gam",  grad_weights);   // dγ
-log_ptr("grad_beta", grad_bias);      // dβ
- log_ptr("X", original_input); 
+    GpuTensor partial_grad_beta;
+    partial_grad_beta.allocate({(int)B_rows, C_cols});
 
+    // =================================================================
+    // [STEP 2] 커널 호출 시, 이 임시 버퍼를 전달
+    // =================================================================
+    launch_layer_norm_backward_optimized(
+        stream,
+        (float*)grad_input.d_ptr_,
+        (float*)partial_grad_gamma.d_ptr_, // [FIX] 임시 버퍼 전달
+        (float*)partial_grad_beta.d_ptr_,  // [FIX] 임시 버퍼 전달
+        (const float*)grad_output.d_ptr_,
+        (const float*)original_input.d_ptr_,
+        (const float*)weights.d_ptr_,
+        (const float*)cache.mean.d_ptr_,
+        (const float*)cache.rstd.d_ptr_,
+        static_cast<int>(B_rows),
+        C_cols,
+        eps_
+    );
 
 
     launch_layer_norm_backward_optimized(
         stream,
         (float*)grad_input.d_ptr_,
-        (float*)grad_weights.d_ptr_,
-        (float*)grad_bias.d_ptr_,
+        (float*)partial_grad_gamma.d_ptr_,
+        (float*)partial_grad_beta.d_ptr_,
         (const float*)grad_output.d_ptr_,
-  
-          (const float*)original_input.d_ptr_, 
+        (const float*)original_input.d_ptr_,
         (const float*)weights.d_ptr_,
         (const float*)cache.mean.d_ptr_,
         (const float*)cache.rstd.d_ptr_,
         static_cast<int>(B_rows),
-        C_cols
+        C_cols,
+        eps_
     );
+
+    // [FIX] 불필요한 zero_out 호출을 삭제합니다.
+    // reduce_sum_along_axis_0 커널이 결과값을 바로 덮어쓰기 때문에
+    // 미리 0으로 채울 필요가 없습니다.
+    reduce_sum_along_axis_0(stream, partial_grad_gamma, grad_weights);
+    reduce_sum_along_axis_0(stream, partial_grad_beta,  grad_bias);
 }
 
 // [NEW] 누락되었던 allocate_gradients 구현

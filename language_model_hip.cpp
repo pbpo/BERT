@@ -210,9 +210,22 @@ CANBertForMaskedLM::~CANBertForMaskedLM()
     if (blas_handle_)  rocblas_destroy_handle(blas_handle_);
 }
 
-void CANBertForMaskedLM::initialize_parameters(float mean, float stddev)
+void CANBertForMaskedLM::initialize_parameters()
 {
-    for (auto* p : all_params_) if (p) p->initialize_random(mean, stddev);
+    for (auto* p : all_params_) {
+        if (!p) continue;
+
+        const std::string& name = p->name();   // 가정: Parameter에 name() getter
+
+        if (name.find("LayerNorm.weight") != std::string::npos)
+            p->initialize(Parameter::InitType::CONSTANT, 1.f);
+        else if (name.find("LayerNorm.bias") != std::string::npos)
+            p->initialize(Parameter::InitType::CONSTANT, 0.f);
+        else if (name.rfind(".bias") != std::string::npos) // Dense bias 등
+            p->initialize(Parameter::InitType::CONSTANT, 0.f);
+        else
+            p->initialize(Parameter::InitType::XAVIER_UNIFORM);
+    }
 }
 
 std::vector<Parameter*> CANBertForMaskedLM::get_parameters()

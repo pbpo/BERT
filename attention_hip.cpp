@@ -326,7 +326,7 @@ void BertAttention::backward(rocblas_handle blas_handle, hipStream_t stream,
             return;
         }
         for (int i = 0; i < 5; ++i) {
-            printf("    > %s[%d] = %f\n", name.c_str(), i, host_data[i]);
+           printf("    > %s[%d] = %.32f\n", name.c_str(), i, host_data[i]);
         }
     };
     printf("\n--- BertAttention 역전파 단계별 값 추적 ---\n");

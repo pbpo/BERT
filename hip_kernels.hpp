@@ -56,12 +56,21 @@ void launch_layer_norm_forward_optimized(
     const float* inp, const float* gamma, const float* beta,
     int B, int C, float epsilon);
 
-// (개선 사항 6: AtomicAdd contention 회피)
 void launch_layer_norm_backward_optimized(
-    hipStream_t stream, float* grad_input, float* grad_gamma_part, float* grad_beta_part,
-    const float* grad_output, const float* input,
-    const float* gamma, const float* mean, const float* rstd,
-    int B, int C);
+    hipStream_t stream,
+    // [SUGGESTION] 파라미터 이름 명확화
+    float* grad_input,
+    float* grad_gamma, // d(gamma)
+    float* grad_beta,  // d(beta)
+    const float* grad_output,
+    const float* input,
+    const float* gamma,
+    const float* mean,
+    const float* rstd,
+    int B,
+    int C,
+    float eps // [FIX] 안정성을 위한 Epsilon 값 추가
+);
 
 // GELU and Add_Bias_GELU
 void launch_add_bias_gelu_kernel(
@@ -84,7 +93,7 @@ void launch_gelu_forward_kernel(
 
 // Reduction Kernels
 void launch_reduce_sum_kernel(hipStream_t stream, float* out_vec, const float* in_matrix, int rows, int cols);
-
+void reduce_sum_along_axis_0(hipStream_t stream, const GpuTensor& input, GpuTensor& output);
 // Softmax Cross Entropy Loss
 void launch_softmax_cross_entropy_loss_backward_optimized(
     hipStream_t stream, float* grad_logits, const float* logits,

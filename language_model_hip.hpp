@@ -80,7 +80,7 @@ public:
     CANBertForMaskedLM(const BertConfig& cfg);
     ~CANBertForMaskedLM();
     
-    void initialize_parameters(float mean = 0.0f, float stddev = 0.02f);
+    void initialize_parameters();
     std::vector<Parameter*> get_parameters();
     
     void train_step(const GpuTensor& input_ids,

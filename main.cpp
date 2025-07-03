@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
             // 3. 모델 생성 및 파라미터 초기화
             // ---------------------------------------------------------------------
             CANBertForMaskedLM model(cfg);
-            model.initialize_parameters(0.0f, cfg.initializer_range);
+            model.initialize_parameters();
 
 
             // ---------------------------------------------------------------------
@@ -123,34 +123,37 @@ int main(int argc, char** argv) {
 
                 // ---------------------------------------------------------------------
                 // 5. 단일 학습 스텝 실행
-                // ---------------------------------------------------------------------
-                fprintf(stderr, "train_step 호출 직전...\n");
-                fprintf(stderr, "모델 포인터: %p\n", &model);
-                fprintf(stderr, "입력 텐서 상태 확인:\n");
-                fprintf(stderr, "  d_input_ids: allocated=%s, ptr=%p\n", 
-                        d_input_ids.is_allocated() ? "true" : "false", d_input_ids.d_ptr_);
-                fprintf(stderr, "  d_attn_mask: allocated=%s, ptr=%p\n", 
-                        d_attn_mask.is_allocated() ? "true" : "false", d_attn_mask.d_ptr_);
-                fprintf(stderr, "  d_labels: allocated=%s, ptr=%p\n", 
-                        d_labels.is_allocated() ? "true" : "false", d_labels.d_ptr_);
-                fprintf(stderr, "  d_loss: allocated=%s, ptr=%p\n", 
-                        d_loss.is_allocated() ? "true" : "false", d_loss.d_ptr_);
-                
-                try {
-                    fprintf(stderr, "model.train_step() 호출 시작...\n");
-                    model.train_step(d_input_ids,
-                                     d_attn_mask,
-                                     d_token_types,
-                                     d_labels,
-                                     d_loss);
-                    fprintf(stderr, "model.train_step() 호출 완료!\n");
-                } catch (const std::exception& e) {
-                    fprintf(stderr, "train_step에서 예외 발생: %s\n", e.what());
-                    throw;
-                } catch (...) {
-                    fprintf(stderr, "train_step에서 알 수 없는 예외 발생\n");
-                    throw;
-                }
+       const int kNumEpochs = 2;             // ★ 원하는 epoch 수
+for (int epoch = 0; epoch < kNumEpochs; ++epoch)
+{
+    fprintf(stderr, "\n========== Epoch %d / %d ==========\n",
+            epoch + 1, kNumEpochs);
+
+    // (1) optional: 데이터·라벨 재셔플/마스킹 로직을 넣으려면 여기서
+    //     h_input_ids / h_labels 등을 다시 채운 뒤 d_input_ids.to_gpu(…) 호출
+
+    try {
+        fprintf(stderr, "model.train_step() 호출 시작...\n");
+        model.train_step(d_input_ids,
+                         d_attn_mask,
+                         d_token_types,
+                         d_labels,
+                         d_loss);
+        fprintf(stderr, "model.train_step() 호출 완료!\n");
+    } catch (const std::exception& e) {
+        fprintf(stderr, "train_step에서 예외 발생: %s\n", e.what());
+        throw;
+    }
+
+    HIP_CHECK(hipDeviceSynchronize());
+
+    // (2) 손실 로그
+    auto h_loss = d_loss.to_cpu<float>();
+    if (!h_loss.empty())
+        std::cout << "[Epoch " << (epoch + 1) << "] Loss : "
+                  << h_loss[0] << '\n';
+}
+std::cout << "Training loop (“" << kNumEpochs << " epoch”) completed.\n";
 
                 HIP_CHECK(hipDeviceSynchronize());
 

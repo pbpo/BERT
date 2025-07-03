@@ -149,13 +149,51 @@ __global__ void layer_norm_forward_kernel_optimized_impl(
         out_b[i] = n * gamma[i] + beta[i];
     }
 }
+// [NEW] Axis-0 Reduction Kernel
+__global__ void reduce_sum_axis0_kernel(const float* input, float* output, int B, int C) {
+    // 공유 메모리 선언
+    extern __shared__ float sdata[];
 
+    // 이 블록이 계산할 열(column) 인덱스
+    const int c = blockIdx.x;
+
+    // 1. 각 스레드가 담당할 행(row)들을 순회하며 자신의 부분 합 계산
+    float thread_sum = 0.0f;
+    for (int b = threadIdx.x; b < B; b += blockDim.x) {
+        thread_sum += input[b * C + c];
+    }
+
+    // 2. 계산된 부분 합을 공유 메모리에 저장
+    sdata[threadIdx.x] = thread_sum;
+    __syncthreads(); // 모든 스레드가 부분 합 계산을 마칠 때까지 대기
+
+    // 3. 공유 메모리 내에서 최종 합산 (리덕션) 수행
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads(); // 각 단계의 합산이 끝날 때까지 대기
+    }
+
+    // 4. 최종 결과를 전역 메모리(output)에 기록 (블록의 0번 스레드만)
+    if (threadIdx.x == 0) {
+        output[c] = sdata[0];
+    }
+}
 __global__ void layer_norm_backward_kernel_optimized_impl(
-    float* __restrict__ grad_input, float* __restrict__ grad_gamma_part, float* __restrict__ grad_beta_part,
+    // 출력
+    float* __restrict__ grad_input,
+    // [FIX] [B, C] 크기의 임시 버퍼를 가리키는 포인터
+    float* __restrict__ partial_grad_gamma,
+    float* __restrict__ partial_grad_beta,
+    // 입력
     const float* __restrict__ grad_output, const float* __restrict__ input,
     const float* __restrict__ gamma, const float* __restrict__ mean, const float* __restrict__ rstd,
-    int B, int C)
+    int B, int C,
+    float eps
+)
 {
+    // ... (shared memory, 포인터 설정 등 앞부분은 동일) ...
     extern __shared__ float shared_data[];
     float* s_warp_results = shared_data;
     float* s_broadcast_params = &s_warp_results[(blockDim.x + warpSize - 1) / warpSize];
@@ -167,21 +205,26 @@ __global__ void layer_norm_backward_kernel_optimized_impl(
     const float mean_b = mean[b];
     const float rstd_b = rstd[b];
 
-    float* grad_gamma_b = grad_gamma_part + b * C;
-    float* grad_beta_b = grad_beta_part + b * C;
+    // [FIX] partial_grad_gamma와 partial_grad_beta는 [B, C] 크기의 임시 버퍼를 가리킵니다.
+    // 각 블록(b)은 이 임시 버퍼의 해당 행에 부분 그래디언트를 기록합니다.
+    float* partial_grad_gamma_b = partial_grad_gamma + b * C;
+    float* partial_grad_beta_b = partial_grad_beta + b * C;
 
     float sum1_thread = 0.0f, sum2_thread = 0.0f;
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         const float x_hat_i = (input_b[i] - mean_b) * rstd_b;
         const float dL_dy_i = grad_output_b[i];
-        grad_gamma_b[i] = dL_dy_i * x_hat_i;
-        grad_beta_b[i] = dL_dy_i;
-        
+
+        // [FIX] 이제 이 계산은 안전합니다. [B, C] 임시 버퍼의 올바른 위치에 쓰기 때문입니다.
+        partial_grad_gamma_b[i] = dL_dy_i * x_hat_i;
+        partial_grad_beta_b[i] = dL_dy_i;
+
         const float dL_dy_gamma_i = dL_dy_i * gamma[i];
         sum1_thread += dL_dy_gamma_i;
         sum2_thread += dL_dy_gamma_i * x_hat_i;
     }
 
+    // --- grad_input 계산 로직 (이 부분은 문제가 없으므로 그대로 둡니다) ---
     const float sum1 = blockReduceSum(sum1_thread);
     const float sum2 = blockReduceSum(sum2_thread);
 
@@ -201,7 +244,28 @@ __global__ void layer_norm_backward_kernel_optimized_impl(
         grad_input_b[i] = rstd_b * dL_dx_i;
     }
 }
+__device__ inline float gelu_device(float x)
+{
+    // 0.044715f 계수를 그대로 쓰는 tanh 근사
+    const float kAlpha = 0.044715f;
+    const float kSqrt2OverPi = 0.7978845608028654f;         // √2/π
+    const float y = kSqrt2OverPi * (x + kAlpha * x * x * x);
+    // tanhf 언더플로 방지
+    const float t = tanhf(fminf(fmaxf(y, -10.f), 10.f));    // clamp−10∼10
+    return 0.5f * x * (1.f + t);
+}
 
+__device__ inline float gelu_grad_device(float x)
+{
+    const float kAlpha = 0.044715f;
+    const float kSqrt2OverPi = 0.7978845608028654f;
+    const float x3   = x * x * x;
+    const float y    = kSqrt2OverPi * (x + kAlpha * x3);
+    const float t    = tanhf(fminf(fmaxf(y, -10.f), 10.f));
+    const float sech = 1.f - t * t;                         // sech² = 1 − tanh²
+    const float dy_dx = kSqrt2OverPi * (1.f + 3.f * kAlpha * x * x);
+    return 0.5f * (1.f + t) + 0.5f * x * sech * dy_dx;
+}
 __global__ void add_bias_gelu_kernel_impl(float* output, const float* input, const float* bias, int M, int N) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -252,18 +316,21 @@ __global__ void gelu_add_bias_backward_kernel_impl(
     }
 }
 
-__global__ void gelu_backward_kernel_impl(float* grad_input, const float* grad_output, const float* input, size_t num_elements) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_elements) {
-        grad_input[idx] = grad_output[idx] * gelu_grad_fn_device(input[idx]);
-    }
+__global__ void gelu_backward_kernel_impl(float* dx,
+                                          const float* dy,
+                                          const float* x,
+                                          size_t n)
+{
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dx[idx] = dy[idx] * gelu_grad_device(x[idx]);
 }
 
-__global__ void gelu_forward_kernel_impl(float* output, const float* input, size_t num_elements) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_elements) {
-        output[idx] = gelu_fn_device(input[idx]);
-    }
+__global__ void gelu_forward_kernel_impl(float* y,
+                                         const float* x,
+                                         size_t n)
+{
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) y[idx] = gelu_device(x[idx]);
 }
 
 __global__ void reduce_sum_optimized_impl(float* out_vec, const float* in_matrix, int rows, int cols) {
@@ -476,8 +543,11 @@ __global__ void scale_and_mask_kernel_impl(float* scores, const float* mask,
     }
 }
 
+// [최종 안정화 버전]
 __global__ void softmax_kernel_impl(float* output, const float* input, int M, int N_softmax_dim) {
+    // 공유 메모리. [0]에는 최댓값, [1]에는 합계를 저장할 것입니다.
     extern __shared__ float sdata[];
+
     int row_idx = blockIdx.x;
     int tid = threadIdx.x;
     if (row_idx >= M) return;
@@ -485,20 +555,42 @@ __global__ void softmax_kernel_impl(float* output, const float* input, int M, in
     const float* row_input = input + row_idx * N_softmax_dim;
     float* row_output = output + row_idx * N_softmax_dim;
 
+    // --- 1. 최댓값 찾기 (오버플로우 방지) ---
     float max_val = -FLT_MAX;
-    for (int i = tid; i < N_softmax_dim; i += blockDim.x) max_val = fmaxf(max_val, row_input[i]);
-    max_val = blockReduceMax(max_val);
-
-    float sum_exp = 0.0f;
-    for (int i = tid; i < N_softmax_dim; i += blockDim.x) sum_exp += expf(row_input[i] - max_val);
-    sum_exp = blockReduceSum(sum_exp);
-
-    sum_exp = fmaxf(sum_exp, 1e-9f);
     for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
-        row_output[i] = expf(row_input[i] - max_val) / sum_exp;
+        max_val = fmaxf(max_val, row_input[i]);
+    }
+    max_val = blockReduceMax(max_val); // 블록 내 모든 스레드의 max_val 중 최댓값을 찾음
+
+    // [안정성] 찾은 최댓값을 공유 메모리를 통해 모든 스레드에 전파
+    if (tid == 0) sdata[0] = max_val;
+    __syncthreads();
+    max_val = sdata[0];
+
+    // --- 2. exp()의 합계 구하기 ---
+    float sum_exp = 0.0f;
+    for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
+        sum_exp += expf(row_input[i] - max_val); // 최댓값을 빼주어 수치 안정성 확보
+    }
+    sum_exp = blockReduceSum(sum_exp); // 블록 내 모든 스레드의 sum_exp를 합산
+
+    // [안정성] 계산된 합계를 공유 메모리를 통해 모든 스레드에 전파
+    if (tid == 0) {
+        sdata[0] = sum_exp;
+    }
+    __syncthreads();
+    sum_exp = sdata[0];
+
+    // --- 3. 최종 결과 계산 ---
+    // [안정성] 분모가 0이 되는 것을 방지하기 위해 아주 작은 값(epsilon)을 더함
+    const float inv_sum_exp = 1.0f / fmaxf(sum_exp, 1e-9f);
+    for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
+        // 모든 스레드가 올바른 max_val과 sum_exp를 사용하여 계산
+        row_output[i] = expf(row_input[i] - max_val) * inv_sum_exp;
     }
 }
 
+// [최종 안정화 버전]
 __global__ void softmax_backward_kernel_impl(
     float* grad_input, const float* grad_output, const float* output,
     int M, int N_softmax_dim)
@@ -512,11 +604,23 @@ __global__ void softmax_backward_kernel_impl(
     const float* row_output = output + row_idx * N_softmax_dim;
     float* row_grad_input = grad_input + row_idx * N_softmax_dim;
 
+    // --- 1. dot product 계산 ---
     float sum_val = 0.0f;
-    for (int j = tid; j < N_softmax_dim; j += blockDim.x) sum_val += row_grad_output[j] * row_output[j];
-    sum_val = blockReduceSum(sum_val);
+    for (int j = tid; j < N_softmax_dim; j += blockDim.x) {
+        sum_val += row_grad_output[j] * row_output[j];
+    }
+    sum_val = blockReduceSum(sum_val); // 블록 내 모든 스레드의 sum_val을 합산
 
+    // [FIX] 계산된 dot product 값을 공유 메모리를 통해 모든 스레드에 전파
+    if (tid == 0) {
+        sdata[0] = sum_val;
+    }
+    __syncthreads();
+    sum_val = sdata[0];
+
+    // --- 2. 최종 그래디언트 계산 ---
     for (int i = tid; i < N_softmax_dim; i += blockDim.x) {
+        // 모든 스레드가 올바른 sum_val 값을 사용하여 그래디언트 계산
         row_grad_input[i] = row_output[i] * (row_grad_output[i] - sum_val);
     }
 }
@@ -620,30 +724,67 @@ void launch_layer_norm_forward_optimized(
                        out, mean, rstd, inp, gamma, beta, B, C, epsilon);
 }
 
+// [FIXED & SUGGESTED] LayerNorm Backward 런처 수정 제안
 void launch_layer_norm_backward_optimized(
-    hipStream_t stream, float* grad_input, float* grad_gamma_part, float* grad_beta_part,
-    const float* grad_output, const float* input,
-    const float* gamma, const float* mean, const float* rstd,
-    int B, int C)
-{
+    hipStream_t stream,
+    // 출력 포인터
+    float* grad_input,
+    float* grad_gamma,
+    float* grad_beta,
+    // 입력 포인터
+    const float* grad_output,
+    const float* input,
+    const float* gamma,
+    const float* mean,
+    const float* rstd,
+    // 차원 정보
+    int B,
+    int C,
+    float eps
+) {
+    // 디버깅을 위한 시작 로그
     printf("Launching layer_norm_backward_optimized with B=%d, C=%d\n", B, C);
 
+    // 처리할 데이터가 없으면 즉시 반환
     if (B == 0 || C == 0) return;
 
-    // 배치 차원과 채널 차원 분리
-    int block_size = std::min(C, KernelConstants::THREADS_PER_BLOCK_DEFAULT); // 채널에 맞는 스레드 수
+    // 스레드 블록 당 스레드 수 설정 (채널 C 크기를 넘지 않도록 제한)
+    int block_size = std::min(C, KernelConstants::THREADS_PER_BLOCK_DEFAULT);
     dim3 block(block_size);
-    dim3 grid((B + block.x - 1) / block.x);  // 배치 차원을 나누어서 grid 크기 설정
 
+    // Grid 크기는 배치(B) 크기와 같게 설정합니다.
+    // 이 구조는 '하나의 스레드 블록이 하나의 데이터 샘플(행)을 처리'하도록 합니다.
+    dim3 grid(B);
+
+    // 공유 메모리 크기 계산
+    // (커널 내부의 Warp 수준 Reduction 등에서 사용될 수 있음)
     size_t shared_mem_size = (block.x + warpSize - 1) / warpSize * sizeof(float) * 2;
-    
-    // 커널 호출
-    HIP_LAUNCH_KERNEL(layer_norm_backward_kernel_optimized_impl, grid, block, shared_mem_size, stream,
-                       grad_input, grad_gamma_part, grad_beta_part,
-                       grad_output, input, gamma, mean, rstd, B, C);
 
-    printf("Finished launching layer_norm_backward_optimized\n");
+    // HIP 커널 실행
+    HIP_LAUNCH_KERNEL(
+        layer_norm_backward_kernel_optimized_impl,
+        grid,
+        block,
+        shared_mem_size,
+        stream,
+        grad_input,
+        grad_gamma,
+        grad_beta,
+        grad_output,
+        input,
+        gamma,
+        mean,
+        rstd,
+        B,
+        C,
+        eps
+    );
+
+    // 커널 실행(launch)이 완료되었음을 알리는 로그
+    // 비동기 호출이므로 실제 GPU 작업 완료를 의미하지는 않습니다.
+    // printf("Finished launching layer_norm_backward_optimized.\n");
 }
+
 
 
 void launch_add_bias_gelu_kernel(hipStream_t stream, float* output, const float* input, const float* bias, int M, int N) {
@@ -800,7 +941,36 @@ void launch_transpose_for_scores_kernel(
     HIP_LAUNCH_KERNEL(transpose_for_scores_kernel_impl, grid, block, 0, stream,
                        output, input, batch_size, seq_len, num_heads, head_size);
 }
+void reduce_sum_along_axis_0(hipStream_t stream, const GpuTensor& input, GpuTensor& output) {
+    // 입력/출력 텐서의 차원 검증
+    assert(input.dims_.size() == 2 && "Input tensor must be 2D");
+    assert(output.dims_.size() == 1 && "Output tensor must be 1D");
+    
+    const int B = input.dims_[0]; // Rows to be reduced
+    const int C = input.dims_[1]; // Columns, size of output
+    
+    assert(C == output.dims_[0] && "Dimension mismatch");
+    if (B == 0 || C == 0) return;
 
+    // 각 출력 요소(C개)당 하나의 스레드 블록을 할당
+    dim3 grid(C);
+    
+    // 블록 당 스레드 수
+    constexpr int block_size = 256;
+    dim3 block(block_size);
+    
+    // 공유 메모리: 블록 내 리덕션을 위해 사용
+    size_t shared_mem_size = block_size * sizeof(float);
+
+    // 커널 호출
+    HIP_LAUNCH_KERNEL(
+        reduce_sum_axis0_kernel,
+        grid, block, shared_mem_size, stream,
+        (const float*)input.d_ptr_,
+        (float*)output.d_ptr_,
+        B, C
+    );
+}
 void launch_transpose_back_kernel(
     hipStream_t stream, float* output, const float* input,
     int batch_size, int seq_len, int num_heads, int head_size)
@@ -825,18 +995,31 @@ void launch_scale_and_mask_kernel(
                        attention_scores, attention_mask, B, N, Sq, Sk, scale);
 }
 
+// [최종 안정화 버전]
 void launch_softmax_kernel(
     hipStream_t stream, float* output, const float* input,
     int M_rows, int N_softmax_dim)
 {
     if (M_rows == 0 || N_softmax_dim == 0) return;
+
     dim3 grid(M_rows);
     dim3 block(std::min(N_softmax_dim, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float);
+
+    // [중요] 공유 메모리 크기를 넉넉하게 할당합니다.
+    // (최댓값 1개 + 합계 1개 = 2개 공간)
+    // 실제로는 warp 단위 리덕션을 위한 추가 공간이 필요할 수 있으므로,
+    // 기존 로직을 유지하되, 최소 2 * sizeof(float) 이상을 보장하는 것이 좋습니다.
+    size_t shared_mem_size = block.x * sizeof(float); // 최소 크기
+    if (shared_mem_size < 2 * sizeof(float)) {
+        shared_mem_size = 2 * sizeof(float);
+    }
+
+
     HIP_LAUNCH_KERNEL(softmax_kernel_impl, grid, block, shared_mem_size, stream,
                        output, input, M_rows, N_softmax_dim);
 }
 
+// [최종 안정화 버전]
 void launch_softmax_backward_kernel(
     hipStream_t stream, float* grad_input, const float* grad_output, const float* output,
     int M_rows, int N_softmax_dim)
@@ -844,7 +1027,10 @@ void launch_softmax_backward_kernel(
     if (M_rows == 0 || N_softmax_dim == 0) return;
     dim3 grid(M_rows);
     dim3 block(std::min(N_softmax_dim, KernelConstants::THREADS_PER_BLOCK_DEFAULT));
-    size_t shared_mem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(float);
+
+    // [중요] 공유 메모리 크기를 블록 내 스레드 수에 맞게 충분히 할당
+    size_t shared_mem_size = block.x * sizeof(float);
+
     HIP_LAUNCH_KERNEL(softmax_backward_kernel_impl, grid, block, shared_mem_size, stream,
                        grad_input, grad_output, output, M_rows, N_softmax_dim);
 }
@@ -856,52 +1042,29 @@ void launch_elementwise_add_kernel(hipStream_t stream, float* out, const float* 
     HIP_LAUNCH_KERNEL(elementwise_add_kernel_impl, grid_dim, block_dim, 0, stream, out, in1, in2, num_elements);
 }
 
-__host__ void validate_memory_access(float* ptr, size_t size, const char* name) {
-    hipPointerAttribute_t attr;
-    hipError_t err = hipPointerGetAttributes(&attr, ptr);
-    
-    if (err != hipSuccess) {
-        printf("[ERROR] %s: 포인터 속성 조회 실패: %s\n", name, hipGetErrorString(err));
-        return;
-    }
-    
-    printf("[MEMORY] %s: ptr=%p, type=%d, device=%d\n", 
-           name, ptr, attr.type, attr.device);
-    
-    // 메모리 범위 검사
-    char test_byte;
-    err = hipMemcpy(&test_byte, ptr, 1, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) {
-        printf("[ERROR] %s: 메모리 읽기 실패 (시작): %s\n", name, hipGetErrorString(err));
-    }
-    
-    err = hipMemcpy(&test_byte, ptr + size - 1, 1, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) {
-        printf("[ERROR] %s: 메모리 읽기 실패 (끝): %s\n", name, hipGetErrorString(err));
-    }
-}
+
 void launch_accumulate_kernel(hipStream_t stream, float* target_and_out, const float* to_add, size_t num_elements) {
     if (num_elements == 0) return;
     
-    std::cout << "[DEBUG] accumulate_kernel 시작" << std::endl;
-    std::cout << "[DEBUG] num_elements = " << num_elements << std::endl;
-    std::cout << "[DEBUG] target_and_out pointer = " << target_and_out << std::endl;
-    std::cout << "[DEBUG] to_add pointer = " << to_add << std::endl;
+    //std::cout << "[DEBUG] accumulate_kernel 시작" << std::endl;
+    //std::cout << "[DEBUG] num_elements = " << num_elements << std::endl;
+    //std::cout << "[DEBUG] target_and_out pointer = " << target_and_out << std::endl;
+    //std::cout << "[DEBUG] to_add pointer = " << to_add << std::endl;
     
     // 입력 값 확인 (처음 10개)
-    float* host_target = new float[std::min(num_elements, (size_t)10)];
-    float* host_to_add = new float[std::min(num_elements, (size_t)10)];
+    //float* host_target = new float[std::min(num_elements, (size_t)10)];
+    //float* host_to_add = new float[std::min(num_elements, (size_t)10)];
     
-    HIP_CHECK(hipMemcpy(host_target, target_and_out, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(host_to_add, to_add, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
+    //HIP_CHECK(hipMemcpy(host_target, target_and_out, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
+    //HIP_CHECK(hipMemcpy(host_to_add, to_add, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
     
-    std::cout << "[DEBUG] 커널 실행 전 값들:" << std::endl;
-    for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
-        std::cout << "[DEBUG] target[" << i << "] = " << std::fixed << std::setprecision(6) << host_target[i] << std::endl;
-    }
-    for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
-        std::cout << "[DEBUG] to_add[" << i << "] = " << std::fixed << std::setprecision(6) << host_to_add[i] << std::endl;
-    }
+    //std::cout << "[DEBUG] 커널 실행 전 값들:" << std::endl;
+    //for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
+        //std::cout << "[DEBUG] target[" << i << "] = " << std::fixed << std::setprecision(6) << host_target[i] << std::endl;
+    //}
+    //for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
+        //std::cout << "[DEBUG] to_add[" << i << "] = " << std::fixed << std::setprecision(6) << host_to_add[i] << std::endl;
+   // }
     
     // 블록과 그리드 크기 계산
     dim3 block_dim(KernelConstants::THREADS_PER_BLOCK_DEFAULT);
@@ -909,36 +1072,36 @@ void launch_accumulate_kernel(hipStream_t stream, float* target_and_out, const f
     
     // 메모리 유효성 검사
     size_t bytes = num_elements * sizeof(float);
-    validate_memory_access(target_and_out, bytes, "target_and_out");
-    validate_memory_access((float*)to_add, bytes, "to_add");
+    //validate_memory_access(target_and_out, bytes, "target_and_out");
+    //validate_memory_access((float*)to_add, bytes, "to_add");
     
-    std::cout << "[DEBUG] grid_dim = " << grid_dim.x << ", block_dim = " << block_dim.x << std::endl;
+    //std::cout << "[DEBUG] grid_dim = " << grid_dim.x << ", block_dim = " << block_dim.x << std::endl;
     
     // 커널 실행
-    std::cout << "[DEBUG] accumulate_kernel_impl 실행 중..." << std::endl;
+    //std::cout << "[DEBUG] accumulate_kernel_impl 실행 중..." << std::endl;
     HIP_LAUNCH_KERNEL(accumulate_kernel_impl, grid_dim, block_dim, 0, stream, 
                        target_and_out, to_add, num_elements);
     
     // 동기화
-    HIP_CHECK(hipStreamSynchronize(stream));
-    std::cout << "[DEBUG] 커널 실행 완료" << std::endl;
+    //HIP_CHECK(hipStreamSynchronize(stream));
+    //std::cout << "[DEBUG] 커널 실행 완료" << std::endl;
     
     // 결과 확인 (처음 10개)
-    float* host_result = new float[std::min(num_elements, (size_t)10)];
-    HIP_CHECK(hipMemcpy(host_result, target_and_out, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
+    //float* host_result = new float[std::min(num_elements, (size_t)10)];
+    //HIP_CHECK(hipMemcpy(host_result, target_and_out, std::min(num_elements, (size_t)10) * sizeof(float), hipMemcpyDeviceToHost));
     
-    std::cout << "[DEBUG] 커널 실행 후 결과:" << std::endl;
-    for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
-        std::cout << "[DEBUG] result[" << i << "] = " << std::fixed << std::setprecision(6) << host_result[i] 
-                  << " (expected: " << (host_target[i] + host_to_add[i]) << ")" << std::endl;
-    }
+    //std::cout << "[DEBUG] 커널 실행 후 결과:" << std::endl;
+    //for (int i = 0; i < std::min(num_elements, (size_t)10); ++i) {
+        //std::cout << "[DEBUG] result[" << i << "] = " << std::fixed << std::setprecision(6) << host_result[i] 
+                //  << " (expected: " << (host_target[i] + host_to_add[i]) << ")" << std::endl;
+    //}
     
     // 메모리 해제
-    delete[] host_target;
-    delete[] host_to_add;
-    delete[] host_result;
+    //delete[] host_target;
+    //delete[] host_to_add;
+    //delete[] host_result;
     
-    std::cout << "[DEBUG] accumulate_kernel 완료" << std::endl;
+    //std::cout << "[DEBUG] accumulate_kernel 완료" << std::endl;
 }
 
 
